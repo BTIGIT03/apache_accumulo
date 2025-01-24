@@ -28,7 +28,6 @@ import org.apache.accumulo.core.client.IteratorSetting;
 import org.apache.accumulo.core.data.Mutation;
 import org.apache.accumulo.core.data.Value;
 import org.apache.accumulo.core.iterators.IteratorUtil.IteratorScope;
-import org.apache.accumulo.core.util.UtilWaitThread;
 import org.apache.accumulo.harness.SharedMiniClusterBase;
 import org.junit.jupiter.api.AfterAll;
 import org.junit.jupiter.api.BeforeAll;
@@ -39,7 +38,7 @@ public class DeletedTablesDontFlushIT extends SharedMiniClusterBase {
 
   @Override
   protected Duration defaultTimeout() {
-    return Duration.ofMinutes(1);
+    return Duration.ofMinutes(2);
   }
 
   @BeforeAll
@@ -61,7 +60,7 @@ public class DeletedTablesDontFlushIT extends SharedMiniClusterBase {
       SlowIterator.setSleepTime(setting, 1000);
       c.tableOperations().attachIterator(tableName, setting, EnumSet.of(IteratorScope.minc));
       // let the configuration change propagate through zookeeper
-      UtilWaitThread.sleep(1000);
+      Thread.sleep(1000);
 
       Mutation m = new Mutation("xyzzy");
       for (int i = 0; i < 100; i++) {

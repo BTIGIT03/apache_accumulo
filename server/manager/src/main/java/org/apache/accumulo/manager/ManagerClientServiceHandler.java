@@ -56,16 +56,16 @@ import org.apache.accumulo.core.data.TableId;
 import org.apache.accumulo.core.dataImpl.KeyExtent;
 import org.apache.accumulo.core.dataImpl.thrift.TKeyExtent;
 import org.apache.accumulo.core.fate.Fate;
+import org.apache.accumulo.core.fate.FateId;
+import org.apache.accumulo.core.fate.FateInstanceType;
 import org.apache.accumulo.core.fate.zookeeper.ZooReaderWriter;
 import org.apache.accumulo.core.manager.thrift.ManagerClientService;
 import org.apache.accumulo.core.manager.thrift.ManagerGoalState;
 import org.apache.accumulo.core.manager.thrift.ManagerMonitorInfo;
 import org.apache.accumulo.core.manager.thrift.ManagerState;
 import org.apache.accumulo.core.manager.thrift.TabletLoadState;
-import org.apache.accumulo.core.manager.thrift.TabletSplit;
 import org.apache.accumulo.core.manager.thrift.ThriftPropertyException;
-import org.apache.accumulo.core.metadata.MetadataTable;
-import org.apache.accumulo.core.metadata.RootTable;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.metadata.TServerInstance;
 import org.apache.accumulo.core.metadata.schema.TabletDeletedException;
 import org.apache.accumulo.core.metadata.schema.TabletMetadata;
@@ -89,6 +89,8 @@ import org.apache.thrift.TException;
 import org.apache.zookeeper.KeeperException.NoNodeException;
 import org.slf4j.Logger;
 
+import com.google.common.collect.Lists;
+
 public class ManagerClientServiceHandler implements ManagerClientService.Iface {
 
   private static final Logger log = Manager.log;
@@ -107,10 +109,10 @@ public class ManagerClientServiceHandler implements ManagerClientService.Iface {
       throw new ThriftSecurityException(c.getPrincipal(), SecurityErrorCode.PERMISSION_DENIED);
     }
 
-    String zTablePath = Constants.ZROOT + "/" + manager.getInstanceID() + Constants.ZTABLES + "/"
-        + tableId + Constants.ZTABLE_FLUSH_ID;
+    String zTablePath = manager.getContext().getZooKeeperRoot() + Constants.ZTABLES + "/" + tableId
+        + Constants.ZTABLE_FLUSH_ID;
 
-    ZooReaderWriter zoo = manager.getContext().getZooReaderWriter();
+    ZooReaderWriter zoo = manager.getContext().getZooSession().asReaderWriter();
     byte[] fid;
     try {
       fid = zoo.mutateExisting(zTablePath, currentValue -> {
@@ -162,7 +164,7 @@ public class ManagerClientServiceHandler implements ManagerClientService.Iface {
         }
       }
 
-      if (tableId.equals(RootTable.ID)) {
+      if (tableId.equals(AccumuloTable.ROOT.tableId())) {
         break; // this code does not properly handle the root tablet. See #798
       }
 
@@ -205,8 +207,8 @@ public class ManagerClientServiceHandler implements ManagerClientService.Iface {
         }
 
       } catch (TabletDeletedException e) {
-        Manager.log.debug("Failed to scan {} table to wait for flush {}", MetadataTable.NAME,
-            tableId, e);
+        Manager.log.debug("Failed to scan {} table to wait for flush {}",
+            AccumuloTable.METADATA.tableName(), tableId, e);
       }
     }
 
@@ -286,9 +288,9 @@ public class ManagerClientServiceHandler implements ManagerClientService.Iface {
     }
     if (stopTabletServers) {
       manager.setManagerGoalState(ManagerGoalState.CLEAN_STOP);
-      EventCoordinator.Listener eventListener = manager.nextEvent.getListener();
+      EventCoordinator.Tracker eventTracker = manager.nextEvent.getTracker();
       do {
-        eventListener.waitForEvents(Manager.ONE_SECOND);
+        eventTracker.waitForEvents(Manager.ONE_SECOND);
       } while (manager.tserverSet.size() > 0);
     }
     manager.setManagerState(ManagerState.STOP);
@@ -314,40 +316,19 @@ public class ManagerClientServiceHandler implements ManagerClientService.Iface {
       }
     }
 
-    Fate<Manager> fate = manager.fate();
-    long tid = fate.startTransaction();
+    Fate<Manager> fate = manager.fate(FateInstanceType.META);
+    FateId fateId = fate.startTransaction();
 
     String msg = "Shutdown tserver " + tabletServer;
 
-    fate.seedTransaction("ShutdownTServer", tid,
-        new TraceRepo<>(new ShutdownTServer(doomed, force)), false, msg);
-    fate.waitForCompletion(tid);
-    fate.delete(tid);
+    fate.seedTransaction(Fate.FateOperation.SHUTDOWN_TSERVER, fateId,
+        new TraceRepo<>(
+            new ShutdownTServer(doomed, manager.tserverSet.getResourceGroup(doomed), force)),
+        false, msg);
+    fate.waitForCompletion(fateId);
+    fate.delete(fateId);
 
     log.debug("FATE op shutting down " + tabletServer + " finished");
-  }
-
-  @Override
-  public void reportSplitExtent(TInfo info, TCredentials credentials, String serverName,
-      TabletSplit split) throws ThriftSecurityException {
-    if (!manager.security.canPerformSystemActions(credentials)) {
-      throw new ThriftSecurityException(credentials.getPrincipal(),
-          SecurityErrorCode.PERMISSION_DENIED);
-    }
-
-    KeyExtent oldTablet = KeyExtent.fromThrift(split.oldTablet);
-    if (manager.migrations.remove(oldTablet) != null) {
-      Manager.log.info("Canceled migration of {}", split.oldTablet);
-    }
-    for (TServerInstance instance : manager.tserverSet.getCurrentServers()) {
-      if (serverName.equals(instance.getHostPort())) {
-        manager.nextEvent.event("%s reported split %s, %s", serverName,
-            KeyExtent.fromThrift(split.newTablets.get(0)),
-            KeyExtent.fromThrift(split.newTablets.get(1)));
-        return;
-      }
-    }
-    Manager.log.warn("Got a split from a server we don't recognize: {}", serverName);
   }
 
   @Override
@@ -365,10 +346,10 @@ public class ManagerClientServiceHandler implements ManagerClientService.Iface {
         Manager.log.error("{} reports assignment failed for tablet {}", serverName, tablet);
         break;
       case LOADED:
-        manager.nextEvent.event("tablet %s was loaded on %s", tablet, serverName);
+        manager.nextEvent.event(tablet, "tablet %s was loaded on %s", tablet, serverName);
         break;
       case UNLOADED:
-        manager.nextEvent.event("tablet %s was unloaded from %s", tablet, serverName);
+        manager.nextEvent.event(tablet, "tablet %s was unloaded from %s", tablet, serverName);
         break;
       case UNLOAD_ERROR:
         Manager.log.error("{} reports unload failed for tablet {}", serverName, tablet);
@@ -537,10 +518,13 @@ public class ManagerClientServiceHandler implements ManagerClientService.Iface {
     }
 
     try {
-      if (value == null || value.isEmpty()) {
+      if (op == TableOperation.REMOVE_PROPERTY) {
         PropUtil.removeProperties(manager.getContext(),
             TablePropKey.of(manager.getContext(), tableId), List.of(property));
-      } else {
+      } else if (op == TableOperation.SET_PROPERTY) {
+        if (value == null || value.isEmpty()) {
+          value = "";
+        }
         PropUtil.setProperties(manager.getContext(), TablePropKey.of(manager.getContext(), tableId),
             Map.of(property, value));
       }
@@ -616,9 +600,24 @@ public class ManagerClientServiceHandler implements ManagerClientService.Iface {
     }
   }
 
+  @Override
+  public void requestTabletHosting(TInfo tinfo, TCredentials credentials, String tableIdStr,
+      List<TKeyExtent> extents) throws ThriftSecurityException, ThriftTableOperationException {
+
+    final TableId tableId = TableId.of(tableIdStr);
+    NamespaceId namespaceId = getNamespaceIdFromTableId(null, tableId);
+    if (!manager.security.canScan(credentials, tableId, namespaceId)) {
+      throw new ThriftSecurityException(credentials.getPrincipal(),
+          SecurityErrorCode.PERMISSION_DENIED);
+    }
+
+    manager.mustBeOnline(tableId);
+
+    manager.hostOndemand(Lists.transform(extents, KeyExtent::fromThrift));
+  }
+
   protected TableId getTableId(ClientContext context, String tableName)
       throws ThriftTableOperationException {
     return ClientServiceHandler.checkTableId(context, tableName, null);
   }
-
 }

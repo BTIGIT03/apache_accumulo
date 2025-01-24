@@ -19,10 +19,15 @@
 package org.apache.accumulo.gc;
 
 import static com.google.common.util.concurrent.Uninterruptibles.sleepUninterruptibly;
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
 
 import java.io.FileNotFoundException;
 import java.io.IOException;
-import java.lang.reflect.InvocationTargetException;
+import java.util.HashMap;
+import java.util.HashSet;
+import java.util.Map;
+import java.util.Map.Entry;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.TimeUnit;
 import java.util.stream.IntStream;
@@ -30,28 +35,32 @@ import java.util.stream.IntStream;
 import org.apache.accumulo.core.Constants;
 import org.apache.accumulo.core.cli.ConfigOpts;
 import org.apache.accumulo.core.client.AccumuloClient;
+import org.apache.accumulo.core.client.admin.servers.ServerId.Type;
 import org.apache.accumulo.core.clientImpl.thrift.TInfo;
 import org.apache.accumulo.core.conf.AccumuloConfiguration;
 import org.apache.accumulo.core.conf.Property;
+import org.apache.accumulo.core.data.TableId;
 import org.apache.accumulo.core.gc.thrift.GCMonitorService.Iface;
 import org.apache.accumulo.core.gc.thrift.GCStatus;
 import org.apache.accumulo.core.gc.thrift.GcCycleStats;
 import org.apache.accumulo.core.lock.ServiceLock;
-import org.apache.accumulo.core.lock.ServiceLock.LockLossReason;
-import org.apache.accumulo.core.lock.ServiceLock.LockWatcher;
 import org.apache.accumulo.core.lock.ServiceLockData;
 import org.apache.accumulo.core.lock.ServiceLockData.ThriftService;
-import org.apache.accumulo.core.metadata.MetadataTable;
-import org.apache.accumulo.core.metadata.RootTable;
+import org.apache.accumulo.core.lock.ServiceLockSupport.HAServiceLockWatcher;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.metadata.schema.Ample.DataLevel;
-import org.apache.accumulo.core.metrics.MetricsUtil;
+import org.apache.accumulo.core.metrics.MetricsInfo;
 import org.apache.accumulo.core.securityImpl.thrift.TCredentials;
+import org.apache.accumulo.core.spi.balancer.TableLoadBalancer;
 import org.apache.accumulo.core.trace.TraceUtil;
-import org.apache.accumulo.core.util.Halt;
+import org.apache.accumulo.core.util.Timer;
+import org.apache.accumulo.core.util.compaction.ExternalCompactionUtil;
 import org.apache.accumulo.core.util.threads.ThreadPools;
 import org.apache.accumulo.gc.metrics.GcCycleMetrics;
 import org.apache.accumulo.gc.metrics.GcMetrics;
 import org.apache.accumulo.server.AbstractServer;
+import org.apache.accumulo.server.ServerContext;
+import org.apache.accumulo.server.conf.TableConfiguration;
 import org.apache.accumulo.server.fs.VolumeManager;
 import org.apache.accumulo.server.manager.LiveTServerSet;
 import org.apache.accumulo.server.rpc.ServerAddress;
@@ -79,9 +88,12 @@ public class SimpleGarbageCollector extends AbstractServer implements Iface {
       new GCStatus(new GcCycleStats(), new GcCycleStats(), new GcCycleStats(), new GcCycleStats());
 
   private final GcCycleMetrics gcCycleMetrics = new GcCycleMetrics();
+  private ServiceLock gcLock;
+
+  private final Timer lastCompactorCheck = Timer.startNew();
 
   SimpleGarbageCollector(ConfigOpts opts, String[] args) {
-    super("gc", opts, args);
+    super("gc", opts, ServerContext::new, args);
 
     final AccumuloConfiguration conf = getConfiguration();
 
@@ -132,7 +144,7 @@ public class SimpleGarbageCollector extends AbstractServer implements Iface {
   /**
    * Checks if safemode is set - files will not be deleted.
    *
-   * @return number of delete threads
+   * @return true if safe mode is set, false otherwise
    */
   boolean inSafeMode() {
     return getConfiguration().getBoolean(Property.GC_SAFEMODE);
@@ -155,17 +167,13 @@ public class SimpleGarbageCollector extends AbstractServer implements Iface {
       log.error("{}", ex.getMessage(), ex);
       System.exit(1);
     }
+    this.getContext().setServiceLock(gcLock);
 
-    try {
-      MetricsUtil.initializeMetrics(getContext().getConfiguration(), this.applicationName, address,
-          getContext().getInstanceName());
-      MetricsUtil.initializeProducers(this, new GcMetrics(this));
-    } catch (ClassNotFoundException | InstantiationException | IllegalAccessException
-        | IllegalArgumentException | InvocationTargetException | NoSuchMethodException
-        | SecurityException e1) {
-      log.error("Error initializing metrics, metrics will not be emitted.", e1);
-    }
+    MetricsInfo metricsInfo = getContext().getMetricsInfo();
 
+    metricsInfo.addMetricsProducers(this, new GcMetrics(this));
+    metricsInfo.init(MetricsInfo.serviceTags(getContext().getInstanceName(), getApplicationName(),
+        address, getResourceGroup()));
     try {
       long delay = getStartDelay();
       log.debug("Sleeping for {} milliseconds before beginning garbage collection cycles", delay);
@@ -262,12 +270,16 @@ public class SimpleGarbageCollector extends AbstractServer implements Iface {
 
           switch (action) {
             case "compact":
-              accumuloClient.tableOperations().compact(MetadataTable.NAME, null, null, true, true);
-              accumuloClient.tableOperations().compact(RootTable.NAME, null, null, true, true);
+              accumuloClient.tableOperations().compact(AccumuloTable.METADATA.tableName(), null,
+                  null, true, true);
+              accumuloClient.tableOperations().compact(AccumuloTable.ROOT.tableName(), null, null,
+                  true, true);
               break;
             case "flush":
-              accumuloClient.tableOperations().flush(MetadataTable.NAME, null, null, true);
-              accumuloClient.tableOperations().flush(RootTable.NAME, null, null, true);
+              accumuloClient.tableOperations().flush(AccumuloTable.METADATA.tableName(), null, null,
+                  true);
+              accumuloClient.tableOperations().flush(AccumuloTable.ROOT.tableName(), null, null,
+                  true);
               break;
             default:
               log.trace("'none - no action' or invalid value provided: {}", action);
@@ -294,6 +306,25 @@ public class SimpleGarbageCollector extends AbstractServer implements Iface {
 
         gcCycleMetrics.incrementRunCycleCount();
         long gcDelay = getConfiguration().getTimeInMillis(Property.GC_CYCLE_DELAY);
+
+        if (lastCompactorCheck.hasElapsed(gcDelay * 3, MILLISECONDS)) {
+          Map<String,Set<TableId>> resourceMapping = new HashMap<>();
+          for (TableId tid : AccumuloTable.allTableIds()) {
+            TableConfiguration tconf = getContext().getTableConfiguration(tid);
+            String resourceGroup = tconf.get(TableLoadBalancer.TABLE_ASSIGNMENT_GROUP_PROPERTY);
+            resourceGroup =
+                resourceGroup == null ? Constants.DEFAULT_RESOURCE_GROUP_NAME : resourceGroup;
+            resourceMapping.getOrDefault(resourceGroup, new HashSet<>()).add(tid);
+          }
+          for (Entry<String,Set<TableId>> e : resourceMapping.entrySet()) {
+            if (ExternalCompactionUtil.countCompactors(e.getKey(), getContext()) == 0) {
+              log.warn("No Compactors exist in resource group {} for system table {}", e.getKey(),
+                  e.getValue());
+            }
+          }
+          lastCompactorCheck.restart();
+        }
+
         log.debug("Sleeping for {} milliseconds", gcDelay);
         Thread.sleep(gcDelay);
       } catch (InterruptedException e) {
@@ -336,46 +367,47 @@ public class SimpleGarbageCollector extends AbstractServer implements Iface {
   }
 
   private void getZooLock(HostAndPort addr) throws KeeperException, InterruptedException {
-    var path = ServiceLock.path(getContext().getZooKeeperRoot() + Constants.ZGC_LOCK);
-
-    LockWatcher lockWatcher = new LockWatcher() {
-      @Override
-      public void lostLock(LockLossReason reason) {
-        Halt.halt("GC lock in zookeeper lost (reason = " + reason + "), exiting!", 1);
-      }
-
-      @Override
-      public void unableToMonitorLockNode(final Exception e) {
-        // ACCUMULO-3651 Level changed to error and FATAL added to message for slf4j compatibility
-        Halt.halt(-1, () -> log.error("FATAL: No longer able to monitor lock node ", e));
-
-      }
-    };
+    var path = getContext().getServerPaths().createGarbageCollectorPath();
 
     UUID zooLockUUID = UUID.randomUUID();
+    gcLock = new ServiceLock(getContext().getZooSession(), path, zooLockUUID);
+    HAServiceLockWatcher gcLockWatcher = new HAServiceLockWatcher(Type.GARBAGE_COLLECTOR);
+
     while (true) {
-      ServiceLock lock =
-          new ServiceLock(getContext().getZooReaderWriter().getZooKeeper(), path, zooLockUUID);
-      if (lock.tryLock(lockWatcher,
-          new ServiceLockData(zooLockUUID, addr.toString(), ThriftService.GC))) {
-        log.debug("Got GC ZooKeeper lock");
-        return;
+      gcLock.lock(gcLockWatcher, new ServiceLockData(zooLockUUID, addr.toString(), ThriftService.GC,
+          this.getResourceGroup()));
+
+      gcLockWatcher.waitForChange();
+
+      if (gcLockWatcher.isLockAcquired()) {
+        break;
       }
+
+      if (!gcLockWatcher.isFailedToAcquireLock()) {
+        throw new IllegalStateException("gc lock in unknown state");
+      }
+
+      gcLock.tryToCancelAsyncLockOrUnlock();
+
       log.debug("Failed to get GC ZooKeeper lock, will retry");
-      sleepUninterruptibly(1, TimeUnit.SECONDS);
+      sleepUninterruptibly(1000, TimeUnit.MILLISECONDS);
     }
+
+    log.info("Got GC lock.");
+
   }
 
   private HostAndPort startStatsService() {
     var processor = ThriftProcessorTypes.getGcTProcessor(this, getContext());
     IntStream port = getConfiguration().getPortStream(Property.GC_PORT);
     HostAndPort[] addresses = TServerUtils.getHostAndPorts(getHostname(), port);
-    long maxMessageSize = getConfiguration().getAsBytes(Property.GENERAL_MAX_MESSAGE_SIZE);
+    long maxMessageSize = getConfiguration().getAsBytes(Property.RPC_MAX_MESSAGE_SIZE);
     ServerAddress server = TServerUtils.startTServer(getConfiguration(),
         getContext().getThriftServerType(), processor, this.getClass().getSimpleName(),
         "GC Monitor Service", 2, ThreadPools.DEFAULT_TIMEOUT_MILLISECS, 1000, maxMessageSize,
         getContext().getServerSslParams(), getContext().getSaslParams(), 0,
-        getConfiguration().getCount(Property.RPC_BACKLOG), addresses);
+        getConfiguration().getCount(Property.RPC_BACKLOG), getContext().getMetricsInfo(), false,
+        addresses);
     log.debug("Starting garbage collector listening on " + server.address);
     return server.address;
   }
@@ -407,6 +439,11 @@ public class SimpleGarbageCollector extends AbstractServer implements Iface {
 
   public GcCycleMetrics getGcCycleMetrics() {
     return gcCycleMetrics;
+  }
+
+  @Override
+  public ServiceLock getLock() {
+    return gcLock;
   }
 
 }

@@ -18,8 +18,12 @@
  */
 package org.apache.accumulo.manager.tableOps.namespace.create;
 
+import org.apache.accumulo.core.Constants;
+import org.apache.accumulo.core.clientImpl.NamespaceMapping;
 import org.apache.accumulo.core.clientImpl.thrift.TableOperation;
+import org.apache.accumulo.core.fate.FateId;
 import org.apache.accumulo.core.fate.Repo;
+import org.apache.accumulo.core.fate.zookeeper.DistributedReadWriteLock.LockType;
 import org.apache.accumulo.core.fate.zookeeper.ZooUtil.NodeExistsPolicy;
 import org.apache.accumulo.manager.Manager;
 import org.apache.accumulo.manager.tableOps.ManagerRepo;
@@ -39,27 +43,27 @@ class PopulateZookeeperWithNamespace extends ManagerRepo {
   }
 
   @Override
-  public long isReady(long id, Manager environment) throws Exception {
-    return Utils.reserveNamespace(environment, namespaceInfo.namespaceId, id, true, false,
-        TableOperation.CREATE);
+  public long isReady(FateId fateId, Manager environment) throws Exception {
+    return Utils.reserveNamespace(environment, namespaceInfo.namespaceId, fateId, LockType.WRITE,
+        false, TableOperation.CREATE);
   }
 
   @Override
-  public Repo<Manager> call(long tid, Manager manager) throws Exception {
+  public Repo<Manager> call(FateId fateId, Manager manager) throws Exception {
 
     Utils.getTableNameLock().lock();
     try {
-      Utils.checkNamespaceDoesNotExist(manager.getContext(), namespaceInfo.namespaceName,
-          namespaceInfo.namespaceId, TableOperation.CREATE);
-
-      TableManager.prepareNewNamespaceState(manager.getContext(), namespaceInfo.namespaceId,
+      var context = manager.getContext();
+      NamespaceMapping.put(context.getZooSession().asReaderWriter(),
+          context.getZooKeeperRoot() + Constants.ZNAMESPACES, namespaceInfo.namespaceId,
+          namespaceInfo.namespaceName);
+      TableManager.prepareNewNamespaceState(context, namespaceInfo.namespaceId,
           namespaceInfo.namespaceName, NodeExistsPolicy.OVERWRITE);
 
-      PropUtil.setProperties(manager.getContext(),
-          NamespacePropKey.of(manager.getContext(), namespaceInfo.namespaceId),
+      PropUtil.setProperties(context, NamespacePropKey.of(context, namespaceInfo.namespaceId),
           namespaceInfo.props);
 
-      manager.getContext().clearTableListCache();
+      context.clearTableListCache();
 
       return new FinishCreateNamespace(namespaceInfo);
     } finally {
@@ -68,10 +72,10 @@ class PopulateZookeeperWithNamespace extends ManagerRepo {
   }
 
   @Override
-  public void undo(long tid, Manager manager) throws Exception {
+  public void undo(FateId fateId, Manager manager) throws Exception {
     manager.getTableManager().removeNamespace(namespaceInfo.namespaceId);
     manager.getContext().clearTableListCache();
-    Utils.unreserveNamespace(manager, namespaceInfo.namespaceId, tid, true);
+    Utils.unreserveNamespace(manager, namespaceInfo.namespaceId, fateId, LockType.WRITE);
   }
 
 }

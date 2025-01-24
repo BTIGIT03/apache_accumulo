@@ -18,10 +18,14 @@
  */
 package org.apache.accumulo.server.conf.store.impl;
 
+import static java.util.concurrent.TimeUnit.SECONDS;
+
 import java.util.Objects;
 import java.util.concurrent.Executor;
 import java.util.concurrent.TimeUnit;
 
+import org.apache.accumulo.core.util.cache.Caches;
+import org.apache.accumulo.core.util.cache.Caches.CacheName;
 import org.apache.accumulo.core.util.threads.ThreadPools;
 import org.apache.accumulo.server.conf.codec.VersionedProperties;
 import org.apache.accumulo.server.conf.store.PropCache;
@@ -42,37 +46,31 @@ public class PropCacheCaffeineImpl implements PropCache {
 
   public static final int EXPIRE_MIN = 60;
   private static final Logger log = LoggerFactory.getLogger(PropCacheCaffeineImpl.class);
-  private static final Executor executor = ThreadPools.getServerThreadPools().createThreadPool(1,
-      20, 60, TimeUnit.SECONDS, "caffeine-tasks", false);
-
-  private final PropStoreMetrics metrics;
+  private static final Executor executor =
+      ThreadPools.getServerThreadPools().getPoolBuilder("caffeine.prop.cache.tasks")
+          .numCoreThreads(1).numMaxThreads(20).withTimeOut(60L, SECONDS).build();
 
   private final LoadingCache<PropStoreKey<?>,VersionedProperties> cache;
 
   private PropCacheCaffeineImpl(final CacheLoader<PropStoreKey<?>,VersionedProperties> cacheLoader,
-      final PropStoreMetrics metrics, final Ticker ticker, boolean runTasksInline) {
-    this.metrics = metrics;
-    var builder = Caffeine.newBuilder().expireAfterAccess(EXPIRE_MIN, BASE_TIME_UNITS)
-        .evictionListener(this::evictionNotifier);
+      final Ticker ticker, boolean runTasksInline) {
+    Caffeine<Object,Object> caffeine =
+        Caches.getInstance().createNewBuilder(CacheName.PROP_CACHE, true)
+            .expireAfterAccess(EXPIRE_MIN, BASE_TIME_UNITS);
     if (runTasksInline) {
-      builder.executor(Runnable::run);
+      caffeine.executor(Runnable::run);
     } else {
-      builder.executor(executor);
+      caffeine.executor(executor);
     }
     if (ticker != null) {
-      builder.ticker(ticker);
+      caffeine.ticker(ticker);
     }
-    cache = builder.build(cacheLoader);
-  }
-
-  public PropStoreMetrics getMetrics() {
-    return metrics;
+    cache = caffeine.evictionListener(this::evictionNotifier).build(cacheLoader);
   }
 
   void evictionNotifier(PropStoreKey<?> propStoreKey, VersionedProperties value,
       RemovalCause cause) {
     log.trace("Evicted: ID: {} was evicted from cache. Reason: {}", propStoreKey, cause);
-    metrics.incrEviction();
   }
 
   @Override
@@ -82,7 +80,6 @@ public class PropCacheCaffeineImpl implements PropCache {
       return cache.get(propStoreKey);
     } catch (Exception ex) {
       log.info("Cache failed to retrieve properties for: " + propStoreKey, ex);
-      metrics.incrZkError();
       return null;
     }
   }
@@ -113,20 +110,17 @@ public class PropCacheCaffeineImpl implements PropCache {
   }
 
   public static class Builder {
-
-    private final PropStoreMetrics metrics;
     private final ZooPropLoader zooPropLoader;
     private Ticker ticker = null;
     private boolean runTasksInline = false;
 
-    public Builder(final ZooPropLoader zooPropLoader, final PropStoreMetrics metrics) {
+    public Builder(final ZooPropLoader zooPropLoader) {
       Objects.requireNonNull(zooPropLoader, "A PropStoreChangeMonitor must be provided");
       this.zooPropLoader = zooPropLoader;
-      this.metrics = metrics;
     }
 
     public PropCacheCaffeineImpl build() {
-      return new PropCacheCaffeineImpl(zooPropLoader, metrics, ticker, runTasksInline);
+      return new PropCacheCaffeineImpl(zooPropLoader, ticker, runTasksInline);
     }
 
     public Builder forTests(final Ticker ticker) {

@@ -23,6 +23,7 @@ import static org.apache.accumulo.core.util.LazySingletons.RANDOM;
 
 import java.net.InetAddress;
 import java.net.UnknownHostException;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -41,25 +42,30 @@ import java.util.stream.Collectors;
 import org.apache.accumulo.core.client.AccumuloException;
 import org.apache.accumulo.core.client.AccumuloSecurityException;
 import org.apache.accumulo.core.client.PluginEnvironment;
+import org.apache.accumulo.core.client.TableNotFoundException;
 import org.apache.accumulo.core.conf.ConfigurationTypeHelper;
 import org.apache.accumulo.core.conf.Property;
 import org.apache.accumulo.core.data.TableId;
 import org.apache.accumulo.core.data.TabletId;
+import org.apache.accumulo.core.logging.ConditionalLogger.EscalatingLogger;
 import org.apache.accumulo.core.manager.balancer.AssignmentParamsImpl;
 import org.apache.accumulo.core.manager.balancer.BalanceParamsImpl;
 import org.apache.accumulo.core.manager.balancer.TServerStatusImpl;
 import org.apache.accumulo.core.manager.balancer.TableStatisticsImpl;
+import org.apache.accumulo.core.metadata.schema.Ample.DataLevel;
 import org.apache.accumulo.core.spi.balancer.data.TServerStatus;
 import org.apache.accumulo.core.spi.balancer.data.TableStatistics;
 import org.apache.accumulo.core.spi.balancer.data.TabletMigration;
 import org.apache.accumulo.core.spi.balancer.data.TabletServerId;
 import org.apache.accumulo.core.spi.balancer.data.TabletStatistics;
+import org.apache.accumulo.core.util.cache.Caches;
+import org.apache.accumulo.core.util.cache.Caches.CacheName;
 import org.apache.commons.lang3.builder.ToStringBuilder;
 import org.apache.commons.lang3.builder.ToStringStyle;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.event.Level;
 
-import com.github.benmanes.caffeine.cache.Caffeine;
 import com.github.benmanes.caffeine.cache.LoadingCache;
 import com.google.common.collect.HashMultimap;
 import com.google.common.collect.Multimap;
@@ -89,12 +95,17 @@ import com.google.common.collect.Multimap;
  * <b>table.custom.balancer.host.regex.max.outstanding.migrations</b>
  *
  * @since 2.1.0
+ * @deprecated See {@link TableLoadBalancer} as it provides similar functionality using server
+ *             process resource group parameters.
  */
+@Deprecated(since = "4.0.0")
 public class HostRegexTableLoadBalancer extends TableLoadBalancer {
 
   private static final String PROP_PREFIX = Property.TABLE_ARBITRARY_PROP_PREFIX.getKey();
 
   private static final Logger LOG = LoggerFactory.getLogger(HostRegexTableLoadBalancer.class);
+  private static final Logger MIGRATIONS_LOGGER =
+      new EscalatingLogger(LOG, Duration.ofMinutes(5), 1000, Level.WARN);
   public static final String HOST_BALANCER_PREFIX = PROP_PREFIX + "balancer.host.regex.";
   public static final String HOST_BALANCER_OOB_CHECK_KEY =
       PROP_PREFIX + "balancer.host.regex.oob.period";
@@ -174,7 +185,7 @@ public class HostRegexTableLoadBalancer extends TableLoadBalancer {
   }
 
   private static final Set<TabletId> EMPTY_MIGRATIONS = Collections.emptySet();
-  private volatile long lastOOBCheck = System.currentTimeMillis();
+  protected final Map<DataLevel,Long> lastOOBCheckTimes = new HashMap<>(DataLevel.values().length);
   private Map<String,SortedMap<TabletServerId,TServerStatus>> pools = new HashMap<>();
   private final Map<TabletId,TabletMigration> migrationsFromLastPass = new HashMap<>();
   private final Map<TableId,Long> tableToTimeSinceNoMigrations = new HashMap<>();
@@ -320,8 +331,9 @@ public class HostRegexTableLoadBalancer extends TableLoadBalancer {
     this.hrtlbConf = balancerEnvironment.getConfiguration().getDerived(HrtlbConf::new);
 
     tablesRegExCache =
-        Caffeine.newBuilder().expireAfterAccess(1, HOURS).build(key -> balancerEnvironment
-            .getConfiguration(key).getDerived(HostRegexTableLoadBalancer::getRegexes));
+        Caches.getInstance().createNewBuilder(CacheName.HOST_REGEX_BALANCER_TABLE_REGEX, true)
+            .expireAfterAccess(1, HOURS).build(key -> balancerEnvironment.getConfiguration(key)
+                .getDerived(HostRegexTableLoadBalancer::getRegexes));
 
     LOG.info("{}", this);
   }
@@ -357,8 +369,8 @@ public class HostRegexTableLoadBalancer extends TableLoadBalancer {
       }
       LOG.debug("Sending {} tablets to balancer for table {} for assignment within tservers {}",
           e.getValue().size(), tableName, currentView.keySet());
-      getBalancerForTable(e.getKey())
-          .getAssignments(new AssignmentParamsImpl(currentView, e.getValue(), newAssignments));
+      getBalancerForTable(e.getKey()).getAssignments(new AssignmentParamsImpl(currentView,
+          params.currentResourceGroups(), e.getValue(), newAssignments));
       newAssignments.forEach(params::addAssignment);
     }
   }
@@ -382,7 +394,10 @@ public class HostRegexTableLoadBalancer extends TableLoadBalancer {
 
     Map<String,SortedMap<TabletServerId,TServerStatus>> currentGrouped =
         splitCurrentByRegex(params.currentStatus());
-    if ((now - this.lastOOBCheck) > myConf.oobCheckMillis) {
+    final DataLevel currentLevel = DataLevel.valueOf(params.currentLevel());
+
+    if ((now - this.lastOOBCheckTimes.getOrDefault(currentLevel, System.currentTimeMillis()))
+        > myConf.oobCheckMillis) {
       try {
         // Check to see if a tablet is assigned outside the bounds of the pool. If so, migrate it.
         for (String table : tableIdMap.keySet()) {
@@ -442,7 +457,7 @@ public class HostRegexTableLoadBalancer extends TableLoadBalancer {
         }
       } finally {
         // this could have taken a while...get a new time
-        this.lastOOBCheck = System.currentTimeMillis();
+        this.lastOOBCheckTimes.put(currentLevel, System.currentTimeMillis());
       }
     }
 
@@ -495,8 +510,8 @@ public class HostRegexTableLoadBalancer extends TableLoadBalancer {
         continue;
       }
       ArrayList<TabletMigration> newMigrations = new ArrayList<>();
-      getBalancerForTable(tableId)
-          .balance(new BalanceParamsImpl(currentView, migrations, newMigrations));
+      getBalancerForTable(tableId).balance(new BalanceParamsImpl(currentView,
+          params.currentResourceGroups(), migrations, newMigrations, DataLevel.of(tableId)));
 
       if (newMigrations.isEmpty()) {
         tableToTimeSinceNoMigrations.remove(tableId);
@@ -511,6 +526,8 @@ public class HostRegexTableLoadBalancer extends TableLoadBalancer {
 
       migrationsOut.addAll(newMigrations);
       if (migrationsOut.size() >= myConf.maxTServerMigrations) {
+        MIGRATIONS_LOGGER.debug("Table {} migration size : {} is over tserver migration max: {}",
+            tableName, migrationsOut.size(), myConf.maxTServerMigrations);
         break;
       }
     }
@@ -519,7 +536,8 @@ public class HostRegexTableLoadBalancer extends TableLoadBalancer {
       migrationsFromLastPass.put(migration.getTablet(), migration);
     }
 
-    LOG.info("Migrating tablets for balance: {}", migrationsOut);
+    LOG.info("Migrating {} tablets for balance.", migrationsOut.size());
+    LOG.debug("Tablets currently migrating: {}", migrationsOut);
     return minBalanceTime;
   }
 
@@ -561,4 +579,26 @@ public class HostRegexTableLoadBalancer extends TableLoadBalancer {
         .collect(Collectors.joining(", ", "[", "]"));
   }
 
+  @Override
+  public boolean needsReassignment(CurrentAssignment currentAssignment) {
+    String tableName;
+    try {
+      tableName = environment.getTableName(currentAssignment.getTablet().getTable());
+    } catch (TableNotFoundException e) {
+      LOG.trace("Table name not found for {}, assuming table was deleted",
+          currentAssignment.getTablet().getTable(), e);
+      // if the table was deleted, then other parts of Accumulo can sort that out
+      return false;
+    }
+
+    var hostPools = getPoolNamesForHost(currentAssignment.getTabletServer());
+    var poolForTable = getPoolNameForTable(tableName);
+
+    if (!hostPools.contains(poolForTable)) {
+      return true;
+    }
+
+    return getBalancerForTable(currentAssignment.getTablet().getTable())
+        .needsReassignment(currentAssignment);
+  }
 }

@@ -38,8 +38,8 @@ import org.apache.accumulo.core.dataImpl.thrift.IterInfo;
 import org.apache.accumulo.core.dataImpl.thrift.TColumn;
 import org.apache.accumulo.core.dataImpl.thrift.TKeyExtent;
 import org.apache.accumulo.core.dataImpl.thrift.TRange;
-import org.apache.accumulo.core.manager.thrift.FateOperation;
-import org.apache.accumulo.core.metadata.MetadataTable;
+import org.apache.accumulo.core.manager.thrift.TFateOperation;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.security.Authorizations;
 import org.apache.accumulo.core.security.SystemPermission;
 import org.apache.accumulo.core.security.TablePermission;
@@ -81,8 +81,8 @@ public class AuditedSecurityOperation extends SecurityOperation {
   }
 
   private boolean shouldAudit(TCredentials credentials, TableId tableId) {
-    return (audit.isInfoEnabled() || audit.isWarnEnabled()) && !tableId.equals(MetadataTable.ID)
-        && shouldAudit(credentials);
+    return (audit.isInfoEnabled() || audit.isWarnEnabled())
+        && !tableId.equals(AccumuloTable.METADATA.tableId()) && shouldAudit(credentials);
   }
 
   // Is INFO the right level to check? Do we even need that check?
@@ -622,10 +622,10 @@ public class AuditedSecurityOperation extends SecurityOperation {
 
   @Override
   public void grantTablePermission(TCredentials credentials, String user, TableId tableId,
-      TablePermission permission, NamespaceId namespaceId) throws ThriftSecurityException {
-    String tableName = getTableName(tableId);
+      String tableName, TablePermission permission, NamespaceId namespaceId)
+      throws ThriftSecurityException, TableNotFoundException {
     try {
-      super.grantTablePermission(credentials, user, tableId, permission, namespaceId);
+      super.grantTablePermission(credentials, user, tableId, tableName, permission, namespaceId);
       audit(credentials, GRANT_TABLE_PERMISSION_AUDIT_TEMPLATE, permission, tableName, user);
     } catch (ThriftSecurityException ex) {
       audit(credentials, ex, GRANT_TABLE_PERMISSION_AUDIT_TEMPLATE, permission, tableName, user);
@@ -685,18 +685,18 @@ public class AuditedSecurityOperation extends SecurityOperation {
       "action: %s; targetTable: %s:%s";
 
   @Override
-  public boolean canOnlineOfflineTable(TCredentials credentials, TableId tableId, FateOperation op,
+  public boolean canChangeTableState(TCredentials credentials, TableId tableId, TFateOperation op,
       NamespaceId namespaceId) throws ThriftSecurityException {
     String tableName = getTableName(tableId);
     String operation = null;
-    if (op == FateOperation.TABLE_ONLINE) {
+    if (op == TFateOperation.TABLE_ONLINE) {
       operation = "onlineTable";
     }
-    if (op == FateOperation.TABLE_OFFLINE) {
+    if (op == TFateOperation.TABLE_OFFLINE) {
       operation = "offlineTable";
     }
     try {
-      boolean result = super.canOnlineOfflineTable(credentials, tableId, op, namespaceId);
+      boolean result = super.canChangeTableState(credentials, tableId, op, namespaceId);
       audit(credentials, result, CAN_ONLINE_OFFLINE_TABLE_AUDIT_TEMPLATE, operation, tableName,
           tableId);
       return result;
@@ -750,4 +750,5 @@ public class AuditedSecurityOperation extends SecurityOperation {
       throw e;
     }
   }
+
 }
