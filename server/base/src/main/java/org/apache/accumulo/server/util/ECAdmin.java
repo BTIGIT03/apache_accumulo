@@ -18,6 +18,13 @@
  */
 package org.apache.accumulo.server.util;
 
+import java.util.ArrayList;
+import java.util.List;
+import java.util.Map;
+import java.util.Set;
+import java.util.TreeMap;
+
+import org.apache.accumulo.core.client.admin.servers.ServerId;
 import org.apache.accumulo.core.compaction.thrift.CompactionCoordinatorService;
 import org.apache.accumulo.core.compaction.thrift.TExternalCompactionList;
 import org.apache.accumulo.core.dataImpl.KeyExtent;
@@ -145,11 +152,15 @@ public class ECAdmin implements KeywordExecutable {
   }
 
   private void listCompactorsByQueue(ServerContext context) {
-    var queueToCompactorsMap = ExternalCompactionUtil.getCompactorAddrs(context);
-    if (queueToCompactorsMap.isEmpty()) {
+    Set<ServerId> compactors = context.instanceOperations().getServers(ServerId.Type.COMPACTOR);
+    if (compactors.isEmpty()) {
       System.out.println("No Compactors found.");
     } else {
-      queueToCompactorsMap.forEach((q, compactors) -> System.out.println(q + ": " + compactors));
+      Map<String,List<ServerId>> m = new TreeMap<>();
+      compactors.forEach(csi -> {
+        m.putIfAbsent(csi.getResourceGroup(), new ArrayList<>()).add(csi);
+      });
+      m.forEach((q, c) -> System.out.println(q + ": " + c));
     }
   }
 
@@ -173,9 +184,9 @@ public class ECAdmin implements KeywordExecutable {
           var runningCompaction = new RunningCompaction(ec);
           var addr = runningCompaction.getCompactorAddress();
           var kind = runningCompaction.getJob().kind;
-          var queue = runningCompaction.getQueueName();
+          var group = runningCompaction.getGroupName();
           var ke = KeyExtent.fromThrift(runningCompaction.getJob().extent);
-          System.out.format("%s %s %s %s TableId: %s\n", ecid, addr, kind, queue, ke.tableId());
+          System.out.format("%s %s %s %s TableId: %s\n", ecid, addr, kind, group, ke.tableId());
           if (details) {
             var runningCompactionInfo = new RunningCompactionInfo(ec);
             var status = runningCompactionInfo.status;

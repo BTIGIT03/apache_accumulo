@@ -18,6 +18,8 @@
  */
 package org.apache.accumulo.test.functional;
 
+import static org.apache.accumulo.core.metrics.Metric.MINC_PAUSED;
+import static org.apache.accumulo.test.compaction.ExternalCompactionTestUtils.getActiveCompactions;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertNull;
 import static org.junit.jupiter.api.Assertions.assertTrue;
@@ -32,7 +34,6 @@ import org.apache.accumulo.core.client.AccumuloClient;
 import org.apache.accumulo.core.client.Scanner;
 import org.apache.accumulo.core.client.admin.TableOperations;
 import org.apache.accumulo.core.conf.Property;
-import org.apache.accumulo.core.metrics.MetricsProducer;
 import org.apache.accumulo.harness.MiniClusterConfigurationCallback;
 import org.apache.accumulo.harness.SharedMiniClusterBase;
 import org.apache.accumulo.minicluster.MemoryUnit;
@@ -53,11 +54,9 @@ public class MemoryStarvedMinCIT extends SharedMiniClusterBase {
 
     @Override
     public void configureMiniCluster(MiniAccumuloConfigImpl cfg, Configuration coreSite) {
-      cfg.setNumTservers(1);
+      cfg.getClusterServerConfiguration().setNumDefaultTabletServers(1);
       cfg.setMemory(ServerType.TABLET_SERVER, 256, MemoryUnit.MEGABYTE);
       // Configure the LowMemoryDetector in the TabletServer
-      // check on 1s intervals and set low mem condition if more than 80% of
-      // the heap is used.
       cfg.setProperty(Property.GENERAL_LOW_MEM_DETECTOR_INTERVAL, "5s");
       cfg.setProperty(Property.GENERAL_LOW_MEM_DETECTOR_THRESHOLD,
           Double.toString(MemoryStarvedScanIT.FREE_MEMORY_THRESHOLD));
@@ -73,7 +72,7 @@ public class MemoryStarvedMinCIT extends SharedMiniClusterBase {
     }
   }
 
-  private static final DoubleAdder MINC_PAUSED = new DoubleAdder();
+  private static final DoubleAdder MINC_PAUSED_COUNT = new DoubleAdder();
   private static TestStatsDSink sink;
   private static Thread metricConsumer;
 
@@ -89,9 +88,9 @@ public class MemoryStarvedMinCIT extends SharedMiniClusterBase {
           }
           if (line.startsWith("accumulo")) {
             Metric metric = TestStatsDSink.parseStatsDMetric(line);
-            if (MetricsProducer.METRICS_MINC_PAUSED.equals(metric.getName())) {
+            if (MINC_PAUSED.getName().equals(metric.getName())) {
               double val = Double.parseDouble(metric.getValue());
-              MINC_PAUSED.add(val);
+              MINC_PAUSED_COUNT.add(val);
             }
           }
         }
@@ -113,7 +112,7 @@ public class MemoryStarvedMinCIT extends SharedMiniClusterBase {
   @BeforeEach
   public void beforeEach() {
     // Reset the client side counters
-    MINC_PAUSED.reset();
+    MINC_PAUSED_COUNT.reset();
   }
 
   @Test
@@ -143,21 +142,21 @@ public class MemoryStarvedMinCIT extends SharedMiniClusterBase {
 
         MemoryStarvedScanIT.consumeServerMemory(scanner);
 
-        int paused = MINC_PAUSED.intValue();
+        int paused = MINC_PAUSED_COUNT.intValue();
         assertEquals(0, paused);
 
         ingestThread.start();
 
         while (paused <= 0) {
           Thread.sleep(1000);
-          paused = MINC_PAUSED.intValue();
+          paused = MINC_PAUSED_COUNT.intValue();
         }
 
         MemoryStarvedScanIT.freeServerMemory(client);
         ingestThread.interrupt();
         ingestThread.join();
         assertNull(error.get());
-        assertTrue(client.instanceOperations().getActiveCompactions().stream()
+        assertTrue(getActiveCompactions(client.instanceOperations()).stream()
             .anyMatch(ac -> ac.getPausedCount() > 0));
       }
     }

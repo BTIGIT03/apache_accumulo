@@ -18,9 +18,12 @@
  */
 package org.apache.accumulo.server.compaction;
 
+import static java.util.concurrent.TimeUnit.MILLISECONDS;
+
 import java.io.IOException;
 import java.text.DateFormat;
 import java.text.SimpleDateFormat;
+import java.time.Duration;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -31,8 +34,10 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Set;
 import java.util.concurrent.Callable;
+import java.util.concurrent.atomic.AtomicBoolean;
 import java.util.concurrent.atomic.AtomicInteger;
 import java.util.concurrent.atomic.AtomicLong;
+import java.util.concurrent.atomic.LongAdder;
 
 import org.apache.accumulo.core.client.IteratorSetting;
 import org.apache.accumulo.core.conf.AccumuloConfiguration;
@@ -53,10 +58,11 @@ import org.apache.accumulo.core.iteratorsImpl.IteratorConfigUtil;
 import org.apache.accumulo.core.iteratorsImpl.system.ColumnFamilySkippingIterator;
 import org.apache.accumulo.core.iteratorsImpl.system.DeletingIterator;
 import org.apache.accumulo.core.iteratorsImpl.system.InterruptibleIterator;
+import org.apache.accumulo.core.iteratorsImpl.system.IterationInterruptedException;
 import org.apache.accumulo.core.iteratorsImpl.system.MultiIterator;
-import org.apache.accumulo.core.metadata.MetadataTable;
+import org.apache.accumulo.core.logging.TabletLogger;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.metadata.ReferencedTabletFile;
-import org.apache.accumulo.core.metadata.RootTable;
 import org.apache.accumulo.core.metadata.StoredTabletFile;
 import org.apache.accumulo.core.metadata.schema.DataFileValue;
 import org.apache.accumulo.core.spi.crypto.CryptoService;
@@ -64,18 +70,17 @@ import org.apache.accumulo.core.tabletserver.thrift.TCompactionReason;
 import org.apache.accumulo.core.trace.TraceUtil;
 import org.apache.accumulo.core.util.LocalityGroupUtil;
 import org.apache.accumulo.core.util.LocalityGroupUtil.LocalityGroupConfigurationError;
-import org.apache.accumulo.core.util.ratelimit.RateLimiter;
+import org.apache.accumulo.core.util.Timer;
 import org.apache.accumulo.server.ServerContext;
 import org.apache.accumulo.server.fs.VolumeManager;
 import org.apache.accumulo.server.iterators.SystemIteratorEnvironment;
 import org.apache.accumulo.server.mem.LowMemoryDetector.DetectionScope;
-import org.apache.accumulo.server.problems.ProblemReport;
 import org.apache.accumulo.server.problems.ProblemReportingIterator;
-import org.apache.accumulo.server.problems.ProblemReports;
-import org.apache.accumulo.server.problems.ProblemType;
 import org.apache.hadoop.fs.FileSystem;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+
+import com.google.common.collect.Collections2;
 
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.context.Scope;
@@ -93,10 +98,6 @@ public class FileCompactor implements Callable<CompactionStats> {
     boolean isCompactionEnabled();
 
     IteratorScope getIteratorScope();
-
-    RateLimiter getReadLimiter();
-
-    RateLimiter getWriteLimiter();
 
     SystemIteratorEnvironment createIteratorEnv(ServerContext context,
         AccumuloConfiguration acuTableConf, TableId tableId);
@@ -119,17 +120,35 @@ public class FileCompactor implements Callable<CompactionStats> {
 
   // things to report
   private String currentLocalityGroup = "";
-  private final long startTime;
+  private volatile Timer startTime;
 
-  private final AtomicLong entriesRead = new AtomicLong(0);
-  private final AtomicLong entriesWritten = new AtomicLong(0);
   private final AtomicInteger timesPaused = new AtomicInteger(0);
+
+  private final AtomicLong currentEntriesRead = new AtomicLong(0);
+  private final AtomicLong currentEntriesWritten = new AtomicLong(0);
+
+  // These track the cumulative count of entries (read and written) that has been recorded in
+  // the global counts. Their purpose is to avoid double counting of metrics during the update of
+  // global statistics.
+  private final AtomicLong lastRecordedEntriesRead = new AtomicLong(0);
+  private final AtomicLong lastRecordedEntriesWritten = new AtomicLong(0);
+
+  private static final LongAdder totalEntriesRead = new LongAdder();
+  private static final LongAdder totalEntriesWritten = new LongAdder();
+  private static final Timer lastUpdateTime = Timer.startNew();
+
   private final DateFormat dateFormatter = new SimpleDateFormat("yyyy/MM/dd HH:mm:ss.SSS");
 
   // a unique id to identify a compactor
   private final long compactorID = nextCompactorID.getAndIncrement();
   protected volatile Thread thread;
   private final ServerContext context;
+
+  private final AtomicBoolean interruptFlag = new AtomicBoolean(false);
+
+  public void interrupt() {
+    interruptFlag.set(true);
+  }
 
   public long getCompactorID() {
     return compactorID;
@@ -143,10 +162,61 @@ public class FileCompactor implements Callable<CompactionStats> {
     return currentLocalityGroup;
   }
 
-  private void clearStats() {
-    entriesRead.set(0);
-    entriesWritten.set(0);
+  private void clearCurrentEntryCounts() {
+    currentEntriesRead.set(0);
+    currentEntriesWritten.set(0);
     timesPaused.set(0);
+  }
+
+  private void updateGlobalEntryCounts() {
+    updateTotalEntries(currentEntriesRead, lastRecordedEntriesRead, totalEntriesRead);
+    updateTotalEntries(currentEntriesWritten, lastRecordedEntriesWritten, totalEntriesWritten);
+  }
+
+  /**
+   * Updates the total count of entries by adding the difference between the current count and the
+   * last recorded count to the total.
+   *
+   * @param current The current count of entries
+   * @param recorded The last recorded count of entries
+   * @param total The total count to add the difference to
+   */
+  private void updateTotalEntries(AtomicLong current, AtomicLong recorded, LongAdder total) {
+    long currentCount = current.get();
+    long lastRecorded =
+        recorded.getAndUpdate(recordedValue -> Math.max(recordedValue, currentCount));
+    if (lastRecorded < currentCount) {
+      total.add(currentCount - lastRecorded);
+    }
+  }
+
+  /**
+   * @return the total entries written by compactions over the lifetime of this process.
+   */
+  public static long getTotalEntriesWritten() {
+    updateTotalEntries();
+    return totalEntriesWritten.sum();
+  }
+
+  /**
+   * @return the total entries read by compactions over the lifetime of this process.
+   */
+  public static long getTotalEntriesRead() {
+    updateTotalEntries();
+    return totalEntriesRead.sum();
+  }
+
+  /**
+   * Updates total entries read and written for all currently running compactions. Compactions will
+   * update the global stats when they finish. This can be called to update them sooner. This method
+   * is rate limited, so it will not cause issues if called too frequently.
+   */
+  private static void updateTotalEntries() {
+    if (!lastUpdateTime.hasElapsed(100, MILLISECONDS)) {
+      return;
+    }
+    runningCompactions.forEach(FileCompactor::updateGlobalEntryCounts);
+    lastUpdateTime.restart();
   }
 
   protected static final Set<FileCompactor> runningCompactions =
@@ -179,8 +249,6 @@ public class FileCompactor implements Callable<CompactionStats> {
     this.iterators = iterators;
     this.cryptoService = cs;
     this.metrics = metrics;
-
-    startTime = System.currentTimeMillis();
   }
 
   public VolumeManager getVolumeManager() {
@@ -211,13 +279,17 @@ public class FileCompactor implements Callable<CompactionStats> {
 
     CompactionStats majCStats = new CompactionStats();
 
+    startTime = Timer.startNew();
+
     boolean remove = runningCompactions.add(this);
 
-    clearStats();
+    String threadStartDate = dateFormatter.format(new Date());
+
+    clearCurrentEntryCounts();
 
     String oldThreadName = Thread.currentThread().getName();
-    String newThreadName = "MajC compacting " + extent + " started "
-        + dateFormatter.format(new Date()) + " file: " + outputFile;
+    String newThreadName =
+        "MajC compacting " + extent + " started " + threadStartDate + " file: " + outputFile;
     Thread.currentThread().setName(newThreadName);
     thread = Thread.currentThread();
     try {
@@ -226,14 +298,15 @@ public class FileCompactor implements Callable<CompactionStats> {
 
       final boolean isMinC = env.getIteratorScope() == IteratorUtil.IteratorScope.minc;
 
-      final boolean dropCacheBehindOutput = !RootTable.ID.equals(this.extent.tableId())
-          && !MetadataTable.ID.equals(this.extent.tableId())
-          && ((isMinC && acuTableConf.getBoolean(Property.TABLE_MINC_OUTPUT_DROP_CACHE))
-              || (!isMinC && acuTableConf.getBoolean(Property.TABLE_MAJC_OUTPUT_DROP_CACHE)));
+      final boolean dropCacheBehindOutput =
+          !AccumuloTable.ROOT.tableId().equals(this.extent.tableId())
+              && !AccumuloTable.METADATA.tableId().equals(this.extent.tableId())
+              && ((isMinC && acuTableConf.getBoolean(Property.TABLE_MINC_OUTPUT_DROP_CACHE))
+                  || (!isMinC && acuTableConf.getBoolean(Property.TABLE_MAJC_OUTPUT_DROP_CACHE)));
 
       WriterBuilder outBuilder =
           fileFactory.newWriterBuilder().forFile(outputFile, ns, ns.getConf(), cryptoService)
-              .withTableConfiguration(acuTableConf).withRateLimiter(env.getWriteLimiter());
+              .withTableConfiguration(acuTableConf);
       if (dropCacheBehindOutput) {
         outBuilder.dropCachesBehind();
       }
@@ -285,8 +358,21 @@ public class FileCompactor implements Callable<CompactionStats> {
     } catch (CompactionCanceledException e) {
       log.debug("Compaction canceled {}", extent);
       throw e;
+    } catch (IterationInterruptedException iie) {
+      if (!env.isCompactionEnabled()) {
+        log.debug("Compaction canceled {}", extent);
+        throw new CompactionCanceledException();
+      }
+      log.debug("RFile interrupted {}", extent);
+      throw iie;
     } catch (IOException | RuntimeException e) {
-      log.error("{}", e.getMessage(), e);
+      Collection<String> inputFileNames =
+          Collections2.transform(getFilesToCompact(), StoredTabletFile::getFileName);
+      String outputFileName = outputFile.getFileName();
+      log.error(
+          "Compaction error. Compaction info: "
+              + "extent: {}, input files: {}, output file: {}, iterators: {}, start date: {}",
+          getExtent(), inputFileNames, outputFileName, getIterators(), threadStartDate, e);
       throw e;
     } finally {
       Thread.currentThread().setName(oldThreadName);
@@ -294,6 +380,8 @@ public class FileCompactor implements Callable<CompactionStats> {
         thread = null;
         runningCompactions.remove(this);
       }
+
+      updateGlobalEntryCounts();
 
       try {
         if (mfw != null) {
@@ -338,24 +426,20 @@ public class FileCompactor implements Callable<CompactionStats> {
         FileSKVIterator reader;
 
         reader = fileFactory.newReaderBuilder().forFile(dataFile, fs, fs.getConf(), cryptoService)
-            .withTableConfiguration(acuTableConf).withRateLimiter(env.getReadLimiter())
-            .dropCachesBehind().build();
+            .withTableConfiguration(acuTableConf).dropCachesBehind().build();
 
         readers.add(reader);
 
-        InterruptibleIterator iter = new ProblemReportingIterator(context, extent.tableId(),
+        InterruptibleIterator iter = new ProblemReportingIterator(extent.tableId(),
             dataFile.getNormalizedPathStr(), false, reader);
+        iter.setInterruptFlag(interruptFlag);
 
         iter = filesToCompact.get(dataFile).wrapFileIterator(iter);
 
         iters.add(iter);
 
       } catch (Exception e) {
-
-        ProblemReports.getInstance(context).report(new ProblemReport(extent.tableId(),
-            ProblemType.FILE_READ, dataFile.getNormalizedPathStr(), e));
-
-        log.warn("Some problem opening data file {} {}", dataFile, e.getMessage(), e);
+        TabletLogger.fileReadFailed(dataFile.toString(), extent, e);
         // failed to open some data file... close the ones that were opened
         for (FileSKVIterator reader : readers) {
           try {
@@ -391,7 +475,7 @@ public class FileCompactor implements Callable<CompactionStats> {
       }
 
       CountingIterator citr =
-          new CountingIterator(new MultiIterator(iters, extent.toDataRange()), entriesRead);
+          new CountingIterator(new MultiIterator(iters, extent.toDataRange()), currentEntriesRead);
       SortedKeyValueIterator<Key,Value> delIter =
           DeletingIterator.wrap(citr, propagateDeletes, DeletingIterator.getBehavior(acuTableConf));
       ColumnFamilySkippingIterator cfsi = new ColumnFamilySkippingIterator(delIter);
@@ -441,7 +525,7 @@ public class FileCompactor implements Callable<CompactionStats> {
 
           if (entriesCompacted % 1024 == 0) {
             // Periodically update stats, do not want to do this too often since its volatile
-            entriesWritten.addAndGet(1024);
+            currentEntriesWritten.addAndGet(1024);
           }
         }
 
@@ -496,19 +580,26 @@ public class FileCompactor implements Callable<CompactionStats> {
   }
 
   long getEntriesRead() {
-    return entriesRead.get();
+    return currentEntriesRead.get();
   }
 
   long getEntriesWritten() {
-    return entriesWritten.get();
+    return currentEntriesWritten.get();
   }
 
   long getTimesPaused() {
     return timesPaused.get();
   }
 
-  long getStartTime() {
-    return startTime;
+  /**
+   * @return the duration since {@link #call()} was called
+   */
+  Duration getAge() {
+    if (startTime == null) {
+      // call() has not been called yet
+      return Duration.ZERO;
+    }
+    return startTime.elapsed();
   }
 
   Iterable<IteratorSetting> getIterators() {

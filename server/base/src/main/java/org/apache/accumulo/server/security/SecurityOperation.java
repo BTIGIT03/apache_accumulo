@@ -41,10 +41,8 @@ import org.apache.accumulo.core.dataImpl.thrift.IterInfo;
 import org.apache.accumulo.core.dataImpl.thrift.TColumn;
 import org.apache.accumulo.core.dataImpl.thrift.TKeyExtent;
 import org.apache.accumulo.core.dataImpl.thrift.TRange;
-import org.apache.accumulo.core.fate.zookeeper.ZooCache;
-import org.apache.accumulo.core.manager.thrift.FateOperation;
-import org.apache.accumulo.core.metadata.MetadataTable;
-import org.apache.accumulo.core.metadata.RootTable;
+import org.apache.accumulo.core.manager.thrift.TFateOperation;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.security.Authorizations;
 import org.apache.accumulo.core.security.NamespacePermission;
 import org.apache.accumulo.core.security.SystemPermission;
@@ -75,7 +73,6 @@ public class SecurityOperation {
   private final PermissionHandler permHandle;
   private final boolean isKerberos;
   private final Supplier<String> rootUserName;
-  private final ZooCache zooCache;
   private final String zkUserPath;
 
   protected final ServerContext context;
@@ -106,8 +103,8 @@ public class SecurityOperation {
       PermissionHandler pm) {
     this.context = context;
     zkUserPath = context.zkUserPath();
-    zooCache = new ZooCache(context.getZooReader(), null);
-    rootUserName = Suppliers.memoize(() -> new String(zooCache.get(zkUserPath), UTF_8));
+    rootUserName =
+        Suppliers.memoize(() -> new String(context.getZooCache().get(zkUserPath), UTF_8));
     authorizor = author;
     authenticator = authent;
     permHandle = pm;
@@ -134,7 +131,7 @@ public class SecurityOperation {
     authorizor.initializeSecurity(credentials, rootPrincipal);
     permHandle.initializeSecurity(credentials, rootPrincipal);
     try {
-      permHandle.grantTablePermission(rootPrincipal, MetadataTable.ID.canonical(),
+      permHandle.grantTablePermission(rootPrincipal, AccumuloTable.METADATA.tableId().canonical(),
           TablePermission.ALTER_TABLE);
     } catch (TableNotFoundException e) {
       // Shouldn't happen
@@ -364,8 +361,8 @@ public class SecurityOperation {
       boolean useCached) throws ThriftSecurityException {
     targetUserExists(user);
 
-    if ((table.equals(MetadataTable.ID) || table.equals(RootTable.ID))
-        && permission.equals(TablePermission.READ)) {
+    if ((table.equals(AccumuloTable.METADATA.tableId())
+        || table.equals(AccumuloTable.ROOT.tableId())) && permission.equals(TablePermission.READ)) {
       return true;
     }
 
@@ -525,7 +522,7 @@ public class SecurityOperation {
         || hasTablePermission(c, tableId, namespaceId, TablePermission.DROP_TABLE, false);
   }
 
-  public boolean canOnlineOfflineTable(TCredentials c, TableId tableId, FateOperation op,
+  public boolean canChangeTableState(TCredentials c, TableId tableId, TFateOperation op,
       NamespaceId namespaceId) throws ThriftSecurityException {
     authenticate(c);
     return hasSystemPermissionWithNamespaceId(c, SystemPermission.SYSTEM, namespaceId, false)
@@ -739,8 +736,9 @@ public class SecurityOperation {
     }
   }
 
-  public void grantTablePermission(TCredentials c, String user, TableId tableId,
-      TablePermission permission, NamespaceId namespaceId) throws ThriftSecurityException {
+  public void grantTablePermission(TCredentials c, String user, TableId tableId, String tableName,
+      TablePermission permission, NamespaceId namespaceId)
+      throws ThriftSecurityException, TableNotFoundException {
     if (!canGrantTable(c, user, tableId, namespaceId)) {
       throw new ThriftSecurityException(c.getPrincipal(), SecurityErrorCode.PERMISSION_DENIED);
     }

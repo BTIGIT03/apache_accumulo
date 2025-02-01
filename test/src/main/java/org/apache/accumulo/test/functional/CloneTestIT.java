@@ -39,6 +39,7 @@ import java.util.TreeSet;
 import java.util.regex.Pattern;
 
 import org.apache.accumulo.cluster.AccumuloCluster;
+import org.apache.accumulo.core.Constants;
 import org.apache.accumulo.core.client.Accumulo;
 import org.apache.accumulo.core.client.AccumuloClient;
 import org.apache.accumulo.core.client.AccumuloException;
@@ -56,8 +57,7 @@ import org.apache.accumulo.core.data.Range;
 import org.apache.accumulo.core.data.TableId;
 import org.apache.accumulo.core.data.Value;
 import org.apache.accumulo.core.manager.state.tables.TableState;
-import org.apache.accumulo.core.metadata.MetadataTable;
-import org.apache.accumulo.core.metadata.RootTable;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.metadata.StoredTabletFile;
 import org.apache.accumulo.core.metadata.schema.MetadataSchema.TabletsSection.DataFileColumnFamily;
 import org.apache.accumulo.core.metadata.schema.MetadataSchema.TabletsSection.ServerColumnFamily;
@@ -138,7 +138,8 @@ public class CloneTestIT extends AccumuloClusterHarness {
   }
 
   private void checkMetadata(String table, AccumuloClient client) throws Exception {
-    try (Scanner s = client.createScanner(MetadataTable.NAME, Authorizations.EMPTY)) {
+    try (Scanner s =
+        client.createScanner(AccumuloTable.METADATA.tableName(), Authorizations.EMPTY)) {
 
       s.fetchColumnFamily(DataFileColumnFamily.NAME);
       ServerColumnFamily.DIRECTORY_COLUMN.fetch(s);
@@ -226,7 +227,6 @@ public class CloneTestIT extends AccumuloClusterHarness {
       AccumuloCluster cluster = getCluster();
       assumeTrue(cluster instanceof MiniAccumuloClusterImpl);
       MiniAccumuloClusterImpl mac = (MiniAccumuloClusterImpl) cluster;
-      String rootPath = mac.getConfig().getDir().getAbsolutePath();
 
       // verify that deleting a new table removes the files
       c.tableOperations().create(table3);
@@ -234,8 +234,12 @@ public class CloneTestIT extends AccumuloClusterHarness {
       c.tableOperations().flush(table3, null, null, true);
       // check for files
       FileSystem fs = getCluster().getFileSystem();
-      String id = c.tableOperations().tableIdMap().get(table3);
-      FileStatus[] status = fs.listStatus(new Path(rootPath + "/accumulo/tables/" + id));
+      final String id = c.tableOperations().tableIdMap().get(table3);
+
+      // the following path expects mini to be configured with a single volume
+      final Path tablePath = new Path(mac.getSiteConfiguration().get(Property.INSTANCE_VOLUMES)
+          + "/" + Constants.TABLE_DIR + "/" + id);
+      FileStatus[] status = fs.listStatus(tablePath);
       assertTrue(status.length > 0);
       // verify disk usage
       List<DiskUsage> diskUsage = c.tableOperations().getDiskUsage(Collections.singleton(table3));
@@ -244,7 +248,6 @@ public class CloneTestIT extends AccumuloClusterHarness {
       // delete the table
       c.tableOperations().delete(table3);
       // verify its gone from the file system
-      Path tablePath = new Path(rootPath + "/accumulo/tables/" + id);
       if (fs.exists(tablePath)) {
         status = fs.listStatus(tablePath);
         assertTrue(status == null || status.length == 0);
@@ -339,16 +342,16 @@ public class CloneTestIT extends AccumuloClusterHarness {
   @Test
   public void testCloneRootTable() {
     try (AccumuloClient client = Accumulo.newClient().from(getClientProps()).build()) {
-      assertThrows(AccumuloException.class,
-          () -> client.tableOperations().clone(RootTable.NAME, "rc1", CloneConfiguration.empty()));
+      assertThrows(AccumuloException.class, () -> client.tableOperations()
+          .clone(AccumuloTable.ROOT.tableName(), "rc1", CloneConfiguration.empty()));
     }
   }
 
   @Test
   public void testCloneMetadataTable() {
     try (AccumuloClient client = Accumulo.newClient().from(getClientProps()).build()) {
-      assertThrows(AccumuloException.class, () -> client.tableOperations().clone(MetadataTable.NAME,
-          "mc1", CloneConfiguration.empty()));
+      assertThrows(AccumuloException.class, () -> client.tableOperations()
+          .clone(AccumuloTable.METADATA.tableName(), "mc1", CloneConfiguration.empty()));
     }
   }
 }

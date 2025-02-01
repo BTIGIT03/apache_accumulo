@@ -18,6 +18,9 @@
  */
 package org.apache.accumulo.manager.upgrade;
 
+import static java.util.concurrent.TimeUnit.SECONDS;
+import static org.apache.accumulo.core.util.threads.ThreadPoolNames.MANAGER_UPGRADE_COORDINATOR_METADATA_POOL;
+import static org.apache.accumulo.server.AccumuloDataVersion.METADATA_FILE_JSON_ENCODING;
 import static org.apache.accumulo.server.AccumuloDataVersion.REMOVE_DEPRECATIONS_FOR_VERSION_3;
 import static org.apache.accumulo.server.AccumuloDataVersion.ROOT_TABLET_META_CHANGES;
 
@@ -29,23 +32,26 @@ import java.util.TreeMap;
 import java.util.concurrent.CompletableFuture;
 import java.util.concurrent.Future;
 import java.util.concurrent.SynchronousQueue;
-import java.util.concurrent.TimeUnit;
 
 import org.apache.accumulo.core.Constants;
 import org.apache.accumulo.core.client.AccumuloException;
-import org.apache.accumulo.core.dataImpl.KeyExtent;
-import org.apache.accumulo.core.fate.ReadOnlyTStore;
-import org.apache.accumulo.core.fate.ZooStore;
+import org.apache.accumulo.core.client.AccumuloSecurityException;
+import org.apache.accumulo.core.client.NamespaceNotFoundException;
+import org.apache.accumulo.core.client.TableNotFoundException;
+import org.apache.accumulo.core.conf.ConfigCheckUtil;
+import org.apache.accumulo.core.metadata.schema.Ample;
 import org.apache.accumulo.core.util.threads.ThreadPools;
 import org.apache.accumulo.core.volume.Volume;
 import org.apache.accumulo.manager.EventCoordinator;
 import org.apache.accumulo.server.AccumuloDataVersion;
 import org.apache.accumulo.server.ServerContext;
 import org.apache.accumulo.server.ServerDirs;
+import org.apache.accumulo.server.conf.CheckCompactionConfig;
 import org.apache.accumulo.server.fs.VolumeManager;
 import org.apache.hadoop.fs.Path;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
+import org.slf4j.event.Level;
 
 import com.google.common.base.Preconditions;
 
@@ -60,7 +66,7 @@ public class UpgradeCoordinator {
      */
     INITIAL {
       @Override
-      public boolean isParentLevelUpgraded(KeyExtent extent) {
+      public boolean isParentLevelUpgraded(Ample.DataLevel level) {
         return false;
       }
     },
@@ -69,8 +75,8 @@ public class UpgradeCoordinator {
      */
     UPGRADED_ZOOKEEPER {
       @Override
-      public boolean isParentLevelUpgraded(KeyExtent extent) {
-        return extent.isRootTablet();
+      public boolean isParentLevelUpgraded(Ample.DataLevel level) {
+        return level == Ample.DataLevel.ROOT;
       }
     },
     /**
@@ -78,8 +84,17 @@ public class UpgradeCoordinator {
      */
     UPGRADED_ROOT {
       @Override
-      public boolean isParentLevelUpgraded(KeyExtent extent) {
-        return extent.isMeta();
+      public boolean isParentLevelUpgraded(Ample.DataLevel level) {
+        return level == Ample.DataLevel.METADATA || level == Ample.DataLevel.ROOT;
+      }
+    },
+    /**
+     * This signifies that zookeeper and the root and metadata tables have been upgraded so far.
+     */
+    UPGRADED_METADATA {
+      @Override
+      public boolean isParentLevelUpgraded(Ample.DataLevel level) {
+        return level == Ample.DataLevel.METADATA || level == Ample.DataLevel.ROOT;
       }
     },
     /**
@@ -87,7 +102,7 @@ public class UpgradeCoordinator {
      */
     COMPLETE {
       @Override
-      public boolean isParentLevelUpgraded(KeyExtent extent) {
+      public boolean isParentLevelUpgraded(Ample.DataLevel level) {
         return true;
       }
     },
@@ -96,7 +111,7 @@ public class UpgradeCoordinator {
      */
     FAILED {
       @Override
-      public boolean isParentLevelUpgraded(KeyExtent extent) {
+      public boolean isParentLevelUpgraded(Ample.DataLevel level) {
         return false;
       }
     };
@@ -105,7 +120,7 @@ public class UpgradeCoordinator {
      * Determines if the place where this extent stores its metadata was upgraded for a given
      * upgrade status.
      */
-    public abstract boolean isParentLevelUpgraded(KeyExtent extent);
+    public abstract boolean isParentLevelUpgraded(Ample.DataLevel level);
   }
 
   private static final Logger log = LoggerFactory.getLogger(UpgradeCoordinator.class);
@@ -113,9 +128,10 @@ public class UpgradeCoordinator {
   private int currentVersion;
   // map of "current version" -> upgrader to next version.
   // Sorted so upgrades execute in order from the oldest supported data version to current
-  private final Map<Integer,Upgrader> upgraders =
-      Collections.unmodifiableMap(new TreeMap<>(Map.of(ROOT_TABLET_META_CHANGES,
-          new Upgrader10to11(), REMOVE_DEPRECATIONS_FOR_VERSION_3, new Upgrader11to12())));
+  private final Map<Integer,
+      Upgrader> upgraders = Collections.unmodifiableMap(new TreeMap<>(
+          Map.of(ROOT_TABLET_META_CHANGES, new Upgrader10to11(), REMOVE_DEPRECATIONS_FOR_VERSION_3,
+              new Upgrader11to12(), METADATA_FILE_JSON_ENCODING, new Upgrader12to13())));
 
   private volatile UpgradeStatus status;
 
@@ -185,9 +201,10 @@ public class UpgradeCoordinator {
         "Not currently in a suitable state to do metadata upgrade %s", status);
 
     if (currentVersion < AccumuloDataVersion.get()) {
-      return ThreadPools.getServerThreadPools().createThreadPool(0, Integer.MAX_VALUE, 60L,
-          TimeUnit.SECONDS, "UpgradeMetadataThreads", new SynchronousQueue<>(), false)
-          .submit(() -> {
+      return ThreadPools.getServerThreadPools()
+          .getPoolBuilder(MANAGER_UPGRADE_COORDINATOR_METADATA_POOL).numCoreThreads(0)
+          .numMaxThreads(Integer.MAX_VALUE).withTimeOut(60L, SECONDS)
+          .withQueue(new SynchronousQueue<>()).build().submit(() -> {
             try {
               for (int v = currentVersion; v < AccumuloDataVersion.get(); v++) {
                 log.info("Upgrading Root - current version {} as step towards target version {}", v,
@@ -197,7 +214,6 @@ public class UpgradeCoordinator {
                     "upgrade root: failed to find root upgrader for version " + currentVersion);
                 upgraders.get(v).upgradeRoot(context);
               }
-
               setStatus(UpgradeStatus.UPGRADED_ROOT, eventCoordinator);
 
               for (int v = currentVersion; v < AccumuloDataVersion.get(); v++) {
@@ -209,6 +225,10 @@ public class UpgradeCoordinator {
                     "upgrade metadata: failed to find upgrader for version " + currentVersion);
                 upgraders.get(v).upgradeMetadata(context);
               }
+              setStatus(UpgradeStatus.UPGRADED_METADATA, eventCoordinator);
+
+              log.info("Validating configuration properties.");
+              validateProperties(context);
 
               log.info("Updating persistent data version.");
               updateAccumuloVersion(context.getServerDirs(), context.getVolumeManager(),
@@ -222,6 +242,30 @@ public class UpgradeCoordinator {
           });
     } else {
       return CompletableFuture.completedFuture(null);
+    }
+  }
+
+  private void validateProperties(ServerContext context) {
+    ConfigCheckUtil.validate(context.getSiteConfiguration(), "site configuration");
+    ConfigCheckUtil.validate(context.getConfiguration(), "system configuration");
+    try {
+      for (String ns : context.namespaceOperations().list()) {
+        ConfigCheckUtil.validate(
+            context.namespaceOperations().getNamespaceProperties(ns).entrySet(),
+            ns + " namespace configuration");
+      }
+      for (String table : context.tableOperations().list()) {
+        ConfigCheckUtil.validate(context.tableOperations().getTableProperties(table).entrySet(),
+            table + " table configuration");
+      }
+    } catch (AccumuloException | AccumuloSecurityException | NamespaceNotFoundException
+        | TableNotFoundException e) {
+      throw new IllegalStateException("Error checking properties", e);
+    }
+    try {
+      CheckCompactionConfig.validate(context.getConfiguration(), Level.INFO);
+    } catch (RuntimeException | ReflectiveOperationException e) {
+      throw new IllegalStateException("Error validating compaction configuration", e);
     }
   }
 
@@ -270,9 +314,13 @@ public class UpgradeCoordinator {
       justification = "Want to immediately stop all manager threads on upgrade error")
   private void abortIfFateTransactions(ServerContext context) {
     try {
-      final ReadOnlyTStore<UpgradeCoordinator> fate = new ZooStore<>(
-          context.getZooKeeperRoot() + Constants.ZFATE, context.getZooReaderWriter());
-      if (!fate.list().isEmpty()) {
+      // The current version of the code creates the new accumulo.fate table on upgrade, so no
+      // attempt is made to read it here. Attempting to read it this point would likely cause a hang
+      // as tablets are not assigned when this is called. The Fate code is not used to read from
+      // zookeeper below because the serialization format changed in zookeeper, that is why a direct
+      // read is performed.
+      if (!context.getZooSession().asReader()
+          .getChildren(context.getZooKeeperRoot() + Constants.ZFATE).isEmpty()) {
         throw new AccumuloException("Aborting upgrade because there are"
             + " outstanding FATE transactions from a previous Accumulo version."
             + " You can start the tservers and then use the shell to delete completed "

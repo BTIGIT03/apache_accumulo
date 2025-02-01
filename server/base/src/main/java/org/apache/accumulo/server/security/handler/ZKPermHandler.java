@@ -27,20 +27,19 @@ import java.util.Map.Entry;
 import java.util.Set;
 import java.util.TreeSet;
 
+import org.apache.accumulo.core.Constants;
 import org.apache.accumulo.core.client.AccumuloSecurityException;
 import org.apache.accumulo.core.client.NamespaceNotFoundException;
 import org.apache.accumulo.core.client.TableNotFoundException;
 import org.apache.accumulo.core.clientImpl.Namespace;
 import org.apache.accumulo.core.clientImpl.thrift.SecurityErrorCode;
-import org.apache.accumulo.core.data.InstanceId;
 import org.apache.accumulo.core.data.NamespaceId;
 import org.apache.accumulo.core.data.TableId;
 import org.apache.accumulo.core.fate.zookeeper.ZooCache;
 import org.apache.accumulo.core.fate.zookeeper.ZooReaderWriter;
 import org.apache.accumulo.core.fate.zookeeper.ZooUtil.NodeExistsPolicy;
 import org.apache.accumulo.core.fate.zookeeper.ZooUtil.NodeMissingPolicy;
-import org.apache.accumulo.core.metadata.MetadataTable;
-import org.apache.accumulo.core.metadata.RootTable;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.security.NamespacePermission;
 import org.apache.accumulo.core.security.SystemPermission;
 import org.apache.accumulo.core.security.TablePermission;
@@ -65,12 +64,11 @@ public class ZKPermHandler implements PermissionHandler {
 
   @Override
   public void initialize(ServerContext context) {
-    zooCache = new ZooCache(context.getZooReader(), null);
-    zoo = context.getZooReaderWriter();
-    InstanceId instanceId = context.getInstanceID();
+    zooCache = new ZooCache(context.getZooSession());
+    zoo = context.getZooSession().asReaderWriter();
     zkUserPath = context.zkUserPath();
-    ZKTablePath = ZKSecurityTool.getInstancePath(instanceId) + "/tables";
-    ZKNamespacePath = ZKSecurityTool.getInstancePath(instanceId) + "/namespaces";
+    ZKTablePath = context.getZooKeeperRoot() + Constants.ZTABLES;
+    ZKNamespacePath = context.getZooKeeperRoot() + Constants.ZNAMESPACES;
   }
 
   @Override
@@ -402,8 +400,10 @@ public class ZKPermHandler implements PermissionHandler {
     Collections.addAll(rootPerms, SystemPermission.values());
     Map<TableId,Set<TablePermission>> tablePerms = new HashMap<>();
     // Allow the root user to flush the system tables
-    tablePerms.put(RootTable.ID, Collections.singleton(TablePermission.ALTER_TABLE));
-    tablePerms.put(MetadataTable.ID, Collections.singleton(TablePermission.ALTER_TABLE));
+    tablePerms.put(AccumuloTable.ROOT.tableId(),
+        Collections.singleton(TablePermission.ALTER_TABLE));
+    tablePerms.put(AccumuloTable.METADATA.tableId(),
+        Collections.singleton(TablePermission.ALTER_TABLE));
     // essentially the same but on the system namespace, the ALTER_TABLE permission is now redundant
     Map<NamespaceId,Set<NamespacePermission>> namespacePerms = new HashMap<>();
     namespacePerms.put(Namespace.ACCUMULO.id(),

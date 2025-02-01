@@ -30,25 +30,29 @@ import org.apache.accumulo.core.Constants;
 import org.apache.accumulo.core.client.NamespaceNotFoundException;
 import org.apache.accumulo.core.client.TableNotFoundException;
 import org.apache.accumulo.core.clientImpl.ClientContext;
+import org.apache.accumulo.core.clientImpl.Namespace;
 import org.apache.accumulo.core.clientImpl.Namespaces;
 import org.apache.accumulo.core.data.NamespaceId;
 import org.apache.accumulo.core.data.TableId;
 import org.apache.accumulo.core.fate.zookeeper.ZooCache;
 import org.apache.accumulo.core.manager.state.tables.TableState;
+import org.apache.accumulo.core.metadata.AccumuloTable;
+import org.apache.accumulo.core.util.cache.Caches.CacheName;
 
 import com.github.benmanes.caffeine.cache.Cache;
-import com.github.benmanes.caffeine.cache.Caffeine;
 
 public class TableZooHelper implements AutoCloseable {
 
   private final ClientContext context;
   // Per instance cache will expire after 10 minutes in case we
   // encounter an instance not used frequently
-  private final Cache<TableZooHelper,TableMap> instanceToMapCache =
-      Caffeine.newBuilder().expireAfterAccess(10, MINUTES).build();
+  private final Cache<TableZooHelper,TableMap> instanceToMapCache;
 
   public TableZooHelper(ClientContext context) {
     this.context = Objects.requireNonNull(context);
+    instanceToMapCache =
+        this.context.getCaches().createNewBuilder(CacheName.TABLE_ZOO_HELPER_CACHE, true)
+            .expireAfterAccess(10, MINUTES).build();
   }
 
   /**
@@ -58,6 +62,11 @@ public class TableZooHelper implements AutoCloseable {
    *         getCause() of NamespaceNotFoundException
    */
   public TableId getTableId(String tableName) throws TableNotFoundException {
+    for (AccumuloTable systemTable : AccumuloTable.values()) {
+      if (systemTable.tableName().equals(tableName)) {
+        return systemTable.tableId();
+      }
+    }
     try {
       return _getTableIdDetectNamespaceNotFound(EXISTING_TABLE_NAME.validate(tableName));
     } catch (NamespaceNotFoundException e) {
@@ -89,6 +98,11 @@ public class TableZooHelper implements AutoCloseable {
   }
 
   public String getTableName(TableId tableId) throws TableNotFoundException {
+    for (AccumuloTable systemTable : AccumuloTable.values()) {
+      if (systemTable.tableId().equals(tableId)) {
+        return systemTable.tableName();
+      }
+    }
     String tableName = getTableMap().getIdtoNameMap().get(tableId);
     if (tableName == null) {
       throw new TableNotFoundException(tableId.canonical(), null, null);
@@ -159,7 +173,7 @@ public class TableZooHelper implements AutoCloseable {
     String statePath = context.getZooKeeperRoot() + Constants.ZTABLES + "/" + tableId.canonical()
         + Constants.ZTABLE_STATE;
     if (clearCachedState) {
-      context.getZooCache().clear(context.getZooKeeperRoot() + statePath);
+      context.getZooCache().clear(statePath);
       instanceToMapCache.invalidateAll();
     }
     ZooCache zc = context.getZooCache();
@@ -180,6 +194,11 @@ public class TableZooHelper implements AutoCloseable {
   public NamespaceId getNamespaceId(TableId tableId) throws TableNotFoundException {
     checkArgument(context != null, "instance is null");
     checkArgument(tableId != null, "tableId is null");
+
+    if (AccumuloTable.allTableIds().contains(tableId)) {
+      return Namespace.ACCUMULO.id();
+    }
+
     ZooCache zc = context.getZooCache();
     byte[] n = zc.get(context.getZooKeeperRoot() + Constants.ZTABLES + "/" + tableId
         + Constants.ZTABLE_NAMESPACE);

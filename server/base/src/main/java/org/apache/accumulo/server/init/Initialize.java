@@ -41,12 +41,13 @@ import org.apache.accumulo.core.conf.SiteConfiguration;
 import org.apache.accumulo.core.data.InstanceId;
 import org.apache.accumulo.core.fate.zookeeper.ZooReaderWriter;
 import org.apache.accumulo.core.file.FileOperations;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.metadata.RootTable;
 import org.apache.accumulo.core.singletons.SingletonManager;
 import org.apache.accumulo.core.singletons.SingletonManager.Mode;
 import org.apache.accumulo.core.spi.fs.VolumeChooserEnvironment.Scope;
-import org.apache.accumulo.core.util.Pair;
 import org.apache.accumulo.core.volume.VolumeConfiguration;
+import org.apache.accumulo.core.zookeeper.ZooSession;
 import org.apache.accumulo.server.AccumuloDataVersion;
 import org.apache.accumulo.server.ServerContext;
 import org.apache.accumulo.server.ServerDirs;
@@ -54,7 +55,6 @@ import org.apache.accumulo.server.fs.VolumeChooserEnvironmentImpl;
 import org.apache.accumulo.server.fs.VolumeManager;
 import org.apache.accumulo.server.fs.VolumeManagerImpl;
 import org.apache.accumulo.server.security.SecurityUtil;
-import org.apache.accumulo.server.util.ChangeSecret;
 import org.apache.accumulo.server.util.SystemPropUtil;
 import org.apache.accumulo.start.spi.KeywordExecutable;
 import org.apache.commons.lang3.StringUtils;
@@ -107,7 +107,7 @@ public class Initialize implements KeywordExecutable {
       System.out.println();
       System.out.println();
       System.out.println("You can change the instance secret in accumulo by using:");
-      System.out.println("   bin/accumulo " + ChangeSecret.class.getName());
+      System.out.println("   bin/accumulo admin changeSecret");
       System.out.println("You will also need to edit your secret in your configuration"
           + " file by adding the property instance.secret to your"
           + " accumulo.properties. Without this accumulo will not operate correctly");
@@ -162,23 +162,23 @@ public class Initialize implements KeywordExecutable {
 
     try (ServerContext context =
         ServerContext.initialize(initConfig.getSiteConf(), instanceName, instanceId)) {
-      var chooserEnv = new VolumeChooserEnvironmentImpl(Scope.INIT, RootTable.ID, null, context);
+      var chooserEnv =
+          new VolumeChooserEnvironmentImpl(Scope.INIT, AccumuloTable.ROOT.tableId(), null, context);
       String rootTabletDirName = RootTable.ROOT_TABLET_DIR_NAME;
       String ext = FileOperations.getNewFileExtension(DefaultConfiguration.getInstance());
-      String rootTabletFileUri = new Path(
-          fs.choose(chooserEnv, initConfig.getVolumeUris()) + SEPARATOR + TABLE_DIR + SEPARATOR
-              + RootTable.ID + SEPARATOR + rootTabletDirName + SEPARATOR + "00000_00000." + ext)
-          .toString();
+      String rootTabletFileUri = new Path(fs.choose(chooserEnv, initConfig.getVolumeUris())
+          + SEPARATOR + TABLE_DIR + SEPARATOR + AccumuloTable.ROOT.tableId() + SEPARATOR
+          + rootTabletDirName + SEPARATOR + "00000_00000." + ext).toString();
       zki.initialize(context, opts.clearInstanceName, instanceNamePath, rootTabletDirName,
           rootTabletFileUri);
 
       if (!createDirs(fs, instanceId, initConfig.getVolumeUris())) {
         throw new IOException("Problem creating directories on " + fs.getVolumes());
       }
-      var fileSystemInitializer = new FileSystemInitializer(initConfig, zoo, instanceId);
+      var fileSystemInitializer = new FileSystemInitializer(initConfig);
       var rootVol = fs.choose(chooserEnv, initConfig.getVolumeUris());
-      var rootPath = new Path(rootVol + SEPARATOR + TABLE_DIR + SEPARATOR + RootTable.ID + SEPARATOR
-          + rootTabletDirName);
+      var rootPath = new Path(rootVol + SEPARATOR + TABLE_DIR + SEPARATOR
+          + AccumuloTable.ROOT.tableId() + SEPARATOR + rootTabletDirName);
       fileSystemInitializer.initialize(fs, rootPath.toString(), rootTabletFileUri, context);
 
       checkSASL(initConfig);
@@ -453,8 +453,8 @@ public class Initialize implements KeywordExecutable {
     Path versionPath = new Path(aBasePath, Constants.VERSION_DIR);
 
     InstanceId instanceId = VolumeManager.getInstanceIDFromHdfs(iidPath, hadoopConf);
-    for (Pair<Path,Path> replacementVolume : serverDirs.getVolumeReplacements()) {
-      if (aBasePath.equals(replacementVolume.getFirst())) {
+    for (Path replacedVolume : serverDirs.getVolumeReplacements().keySet()) {
+      if (aBasePath.equals(replacedVolume)) {
         log.error(
             "{} is set to be replaced in {} and should not appear in {}."
                 + " It is highly recommended that this property be removed as data"
@@ -526,7 +526,6 @@ public class Initialize implements KeywordExecutable {
     Opts opts = new Opts();
     opts.parseArgs("accumulo init", args);
     var siteConfig = SiteConfiguration.auto();
-    ZooReaderWriter zoo = new ZooReaderWriter(siteConfig);
     SecurityUtil.serverLogin(siteConfig);
     Configuration hadoopConfig = new Configuration();
     InitialConfiguration initConfig = new InitialConfiguration(hadoopConfig, siteConfig);
@@ -540,7 +539,9 @@ public class Initialize implements KeywordExecutable {
         success = addVolumes(fs, initConfig, serverDirs);
       }
       if (!opts.resetSecurity && !opts.addVolumes) {
-        success = doInit(zoo, opts, fs, initConfig);
+        try (var zk = new ZooSession(getClass().getSimpleName(), siteConfig)) {
+          success = doInit(zk.asReaderWriter(), opts, fs, initConfig);
+        }
       }
     } catch (IOException e) {
       log.error("Problem trying to get Volume configuration", e);

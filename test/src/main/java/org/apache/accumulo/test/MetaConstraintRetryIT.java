@@ -30,11 +30,11 @@ import org.apache.accumulo.core.client.MutationsRejectedException;
 import org.apache.accumulo.core.data.Mutation;
 import org.apache.accumulo.core.data.TableId;
 import org.apache.accumulo.core.dataImpl.KeyExtent;
-import org.apache.accumulo.core.metadata.MetadataTable;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.security.TablePermission;
 import org.apache.accumulo.harness.AccumuloClusterHarness;
+import org.apache.accumulo.manager.upgrade.SplitRecovery12to13;
 import org.apache.accumulo.server.ServerContext;
-import org.apache.accumulo.server.util.MetadataTableUtil;
 import org.junit.jupiter.api.Test;
 
 public class MetaConstraintRetryIT extends AccumuloClusterHarness {
@@ -48,8 +48,8 @@ public class MetaConstraintRetryIT extends AccumuloClusterHarness {
   @Test
   public void test() throws Exception {
     try (AccumuloClient client = Accumulo.newClient().from(getClientProps()).build()) {
-      client.securityOperations().grantTablePermission(getAdminPrincipal(), MetadataTable.NAME,
-          TablePermission.WRITE);
+      client.securityOperations().grantTablePermission(getAdminPrincipal(),
+          AccumuloTable.METADATA.tableName(), TablePermission.WRITE);
 
       ServerContext context = getServerContext();
       KeyExtent extent = new KeyExtent(TableId.of("5"), null, null);
@@ -58,7 +58,7 @@ public class MetaConstraintRetryIT extends AccumuloClusterHarness {
       // unknown columns should cause constraint violation
       m.put("badcolfam", "badcolqual", "3");
       var iae = assertThrows(IllegalArgumentException.class,
-          () -> MetadataTableUtil.update(context, null, m, extent));
+          () -> SplitRecovery12to13.update(context, null, m, extent));
       assertEquals(MutationsRejectedException.class, iae.getCause().getClass());
       var mre = (MutationsRejectedException) iae.getCause();
       assertFalse(mre.getConstraintViolationSummaries().isEmpty());

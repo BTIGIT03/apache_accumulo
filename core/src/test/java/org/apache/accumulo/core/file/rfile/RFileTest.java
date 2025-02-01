@@ -18,6 +18,7 @@
  */
 package org.apache.accumulo.core.file.rfile;
 
+import static java.nio.charset.StandardCharsets.UTF_8;
 import static org.apache.accumulo.core.util.LazySingletons.RANDOM;
 import static org.junit.jupiter.api.Assertions.assertEquals;
 import static org.junit.jupiter.api.Assertions.assertFalse;
@@ -63,14 +64,14 @@ import org.apache.accumulo.core.data.Value;
 import org.apache.accumulo.core.file.FileSKVIterator;
 import org.apache.accumulo.core.file.blockfile.cache.impl.BlockCacheConfiguration;
 import org.apache.accumulo.core.file.blockfile.cache.impl.BlockCacheManagerFactory;
-import org.apache.accumulo.core.file.blockfile.cache.lru.LruBlockCacheManager;
+import org.apache.accumulo.core.file.blockfile.cache.tinylfu.TinyLfuBlockCacheManager;
 import org.apache.accumulo.core.file.blockfile.impl.BasicCacheProvider;
 import org.apache.accumulo.core.file.blockfile.impl.CachableBlockFile.CachableBuilder;
 import org.apache.accumulo.core.file.rfile.RFile.Reader;
 import org.apache.accumulo.core.iterators.IteratorEnvironment;
 import org.apache.accumulo.core.iterators.SortedKeyValueIterator;
 import org.apache.accumulo.core.iteratorsImpl.system.ColumnFamilySkippingIterator;
-import org.apache.accumulo.core.metadata.MetadataTable;
+import org.apache.accumulo.core.metadata.AccumuloTable;
 import org.apache.accumulo.core.metadata.schema.MetadataSchema.TabletsSection;
 import org.apache.accumulo.core.metadata.schema.MetadataSchema.TabletsSection.ServerColumnFamily;
 import org.apache.accumulo.core.metadata.schema.MetadataSchema.TabletsSection.TabletColumnFamily;
@@ -190,7 +191,8 @@ public class RFileTest extends AbstractRFileTest {
   }
 
   static Key newKey(String row, String cf, String cq, String cv, long ts) {
-    return new Key(row.getBytes(), cf.getBytes(), cq.getBytes(), cv.getBytes(), ts);
+    return new Key(row.getBytes(UTF_8), cf.getBytes(UTF_8), cq.getBytes(UTF_8), cv.getBytes(UTF_8),
+        ts);
   }
 
   static Value newValue(String val) {
@@ -205,7 +207,6 @@ public class RFileTest extends AbstractRFileTest {
   public void test1() throws IOException {
 
     // test an empty file
-
     TestRFile trf = new TestRFile(conf);
 
     trf.openWriter();
@@ -1513,6 +1514,39 @@ public class RFileTest extends AbstractRFileTest {
   }
 
   @Test
+  public void testEstimateOverlappingEntries() throws IOException {
+    TestRFile trf = new TestRFile(conf);
+    // lower block sizes so estimates are closer
+    trf.openWriter(true, 100, 100);
+
+    // generate 1024 entries
+    int count = 0;
+    for (int row = 0; row < 4; row++) {
+      String rowS = formatString("r_", row);
+      for (int cf = 0; cf < 4; cf++) {
+        String cfS = formatString("cf_", cf);
+        for (int cq = 0; cq < 4; cq++) {
+          String cqS = formatString("cq_", cq);
+          for (int cv = 'A'; cv < 'A' + 4; cv++) {
+            String cvS = "" + (char) cv;
+            for (int ts = 4; ts > 0; ts--) {
+              Key k = newKey(rowS, cfS, cqS, cvS, ts);
+              Value v = newValue("" + count);
+              trf.writer.append(k, v);
+              count++;
+            }
+          }
+        }
+      }
+    }
+    trf.closeWriter();
+
+    trf.openReader();
+    verifyEstimated(trf.reader);
+    trf.closeReader();
+  }
+
+  @Test
   public void testMissingUnreleasedVersions() {
     assertThrows(NullPointerException.class,
         () -> runVersionTest(5, getAccumuloConfig(ConfigMode.CRYPTO_OFF)));
@@ -1549,7 +1583,7 @@ public class RFileTest extends AbstractRFileTest {
     byte[] data = baos.toByteArray();
     SeekableByteArrayInputStream bais = new SeekableByteArrayInputStream(data);
     FSDataInputStream in2 = new FSDataInputStream(bais);
-    aconf.set(Property.TSERV_CACHE_MANAGER_IMPL, LruBlockCacheManager.class.getName());
+    aconf.set(Property.GENERAL_CACHE_MANAGER_IMPL, TinyLfuBlockCacheManager.class.getName());
     aconf.set(Property.TSERV_DEFAULT_BLOCKSIZE, Long.toString(100000));
     aconf.set(Property.TSERV_DATACACHE_SIZE, Long.toString(100000000));
     aconf.set(Property.TSERV_INDEXCACHE_SIZE, Long.toString(100000000));
@@ -2107,7 +2141,7 @@ public class RFileTest extends AbstractRFileTest {
     // If we get here, we have encrypted bytes
     for (Property prop : Property.values()) {
       if (prop.isSensitive()) {
-        byte[] toCheck = prop.getKey().getBytes();
+        byte[] toCheck = prop.getKey().getBytes(UTF_8);
         assertEquals(-1, Bytes.indexOf(rfBytes, toCheck));
       }
     }
@@ -2128,8 +2162,8 @@ public class RFileTest extends AbstractRFileTest {
 
     // mfw.startDefaultLocalityGroup();
 
-    Text tableExtent = new Text(
-        TabletsSection.encodeRow(MetadataTable.ID, TabletsSection.getRange().getEndKey().getRow()));
+    Text tableExtent = new Text(TabletsSection.encodeRow(AccumuloTable.METADATA.tableId(),
+        TabletsSection.getRange().getEndKey().getRow()));
 
     // table tablet's directory
     Key tableDirKey = new Key(tableExtent, ServerColumnFamily.DIRECTORY_COLUMN.getColumnFamily(),
@@ -2147,7 +2181,7 @@ public class RFileTest extends AbstractRFileTest {
     mfw.append(tablePrevRowKey, TabletColumnFamily.encodePrevEndRow(null));
 
     // ----------] default tablet info
-    Text defaultExtent = new Text(TabletsSection.encodeRow(MetadataTable.ID, null));
+    Text defaultExtent = new Text(TabletsSection.encodeRow(AccumuloTable.METADATA.tableId(), null));
 
     // default's directory
     Key defaultDirKey =

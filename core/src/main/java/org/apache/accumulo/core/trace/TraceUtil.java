@@ -21,7 +21,9 @@ package org.apache.accumulo.core.trace;
 import java.lang.reflect.InvocationHandler;
 import java.lang.reflect.InvocationTargetException;
 import java.lang.reflect.Proxy;
+import java.util.HashSet;
 import java.util.Map;
+import java.util.Set;
 import java.util.concurrent.Callable;
 
 import org.apache.accumulo.core.Constants;
@@ -33,6 +35,7 @@ import org.slf4j.LoggerFactory;
 
 import io.opentelemetry.api.GlobalOpenTelemetry;
 import io.opentelemetry.api.OpenTelemetry;
+import io.opentelemetry.api.common.AttributeKey;
 import io.opentelemetry.api.common.Attributes;
 import io.opentelemetry.api.trace.Span;
 import io.opentelemetry.api.trace.SpanBuilder;
@@ -43,7 +46,6 @@ import io.opentelemetry.api.trace.propagation.W3CTraceContextPropagator;
 import io.opentelemetry.context.Context;
 import io.opentelemetry.context.Scope;
 import io.opentelemetry.context.propagation.TextMapGetter;
-import io.opentelemetry.semconv.trace.attributes.SemanticAttributes;
 
 public class TraceUtil {
 
@@ -124,9 +126,9 @@ public class TraceUtil {
     if (enabled) {
       span.setStatus(StatusCode.ERROR);
       span.recordException(e,
-          Attributes.builder().put(SemanticAttributes.EXCEPTION_TYPE, e.getClass().getName())
-              .put(SemanticAttributes.EXCEPTION_MESSAGE, e.getMessage())
-              .put(SemanticAttributes.EXCEPTION_ESCAPED, rethrown).build());
+          Attributes.builder().put(AttributeKey.stringKey("exception.type"), e.getClass().getName())
+              .put(AttributeKey.stringKey("exception.message"), e.getMessage())
+              .put(AttributeKey.booleanKey("exception.escaped"), rethrown).build());
     }
   }
 
@@ -214,8 +216,19 @@ public class TraceUtil {
   private static <T> T wrapRpc(final InvocationHandler handler, final T instance) {
     @SuppressWarnings("unchecked")
     T proxiedInstance = (T) Proxy.newProxyInstance(instance.getClass().getClassLoader(),
-        instance.getClass().getInterfaces(), handler);
+        getInterfaces(instance.getClass()).toArray(new Class<?>[0]), handler);
     return proxiedInstance;
+  }
+
+  private static Set<Class<?>> getInterfaces(Class<?> clazz) {
+    var set = new HashSet<Class<?>>();
+    if (clazz != null) {
+      set.addAll(getInterfaces(clazz.getSuperclass()));
+      for (Class<?> interfaze : clazz.getInterfaces()) {
+        set.add(interfaze);
+      }
+    }
+    return set;
   }
 
 }

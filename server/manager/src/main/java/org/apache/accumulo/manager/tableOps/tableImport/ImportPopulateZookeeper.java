@@ -27,7 +27,9 @@ import org.apache.accumulo.core.clientImpl.TableOperationsImpl;
 import org.apache.accumulo.core.clientImpl.thrift.TableOperation;
 import org.apache.accumulo.core.clientImpl.thrift.TableOperationExceptionType;
 import org.apache.accumulo.core.data.NamespaceId;
+import org.apache.accumulo.core.fate.FateId;
 import org.apache.accumulo.core.fate.Repo;
+import org.apache.accumulo.core.fate.zookeeper.DistributedReadWriteLock.LockType;
 import org.apache.accumulo.core.util.tables.TableNameUtil;
 import org.apache.accumulo.manager.Manager;
 import org.apache.accumulo.manager.tableOps.ManagerRepo;
@@ -42,15 +44,15 @@ class ImportPopulateZookeeper extends ManagerRepo {
 
   private static final long serialVersionUID = 1L;
 
-  private ImportedTableInfo tableInfo;
+  private final ImportedTableInfo tableInfo;
 
   ImportPopulateZookeeper(ImportedTableInfo ti) {
     this.tableInfo = ti;
   }
 
   @Override
-  public long isReady(long tid, Manager environment) throws Exception {
-    return Utils.reserveTable(environment, tableInfo.tableId, tid, true, false,
+  public long isReady(FateId fateId, Manager environment) throws Exception {
+    return Utils.reserveTable(environment, tableInfo.tableId, fateId, LockType.WRITE, false,
         TableOperation.IMPORT);
   }
 
@@ -69,13 +71,13 @@ class ImportPopulateZookeeper extends ManagerRepo {
   }
 
   @Override
-  public Repo<Manager> call(long tid, Manager env) throws Exception {
+  public Repo<Manager> call(FateId fateId, Manager env) throws Exception {
     // reserve the table name in zookeeper or fail
 
     Utils.getTableNameLock().lock();
     try {
       // write tableName & tableId to zookeeper
-      Utils.checkTableDoesNotExist(env.getContext(), tableInfo.tableName, tableInfo.tableId,
+      Utils.checkTableNameDoesNotExist(env.getContext(), tableInfo.tableName, tableInfo.tableId,
           TableOperation.CREATE);
 
       String namespace = TableNameUtil.qualify(tableInfo.tableName).getFirst();
@@ -102,9 +104,9 @@ class ImportPopulateZookeeper extends ManagerRepo {
   }
 
   @Override
-  public void undo(long tid, Manager env) throws Exception {
+  public void undo(FateId fateId, Manager env) throws Exception {
     env.getTableManager().removeTable(tableInfo.tableId);
-    Utils.unreserveTable(env, tableInfo.tableId, tid, true);
+    Utils.unreserveTable(env, tableInfo.tableId, fateId, LockType.WRITE);
     env.getContext().clearTableListCache();
   }
 }

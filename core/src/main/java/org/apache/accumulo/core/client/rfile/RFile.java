@@ -35,9 +35,10 @@ import org.apache.accumulo.core.client.summary.Summary;
 import org.apache.accumulo.core.client.summary.Summary.FileStatistics;
 import org.apache.accumulo.core.conf.Property;
 import org.apache.accumulo.core.data.Key;
+import org.apache.accumulo.core.data.LoadPlan;
 import org.apache.accumulo.core.data.Range;
-import org.apache.accumulo.core.metadata.AbstractTabletFile;
 import org.apache.accumulo.core.security.Authorizations;
+import org.apache.accumulo.core.util.RowRangeUtil;
 import org.apache.hadoop.fs.FileSystem;
 import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.Text;
@@ -100,7 +101,7 @@ public class RFile {
 
       public FencedPath(Path path, Range fence) {
         this.path = Objects.requireNonNull(path);
-        this.fence = AbstractTabletFile.requireRowRange(fence);
+        this.fence = RowRangeUtil.requireKeyExtentDataRange(fence);
       }
 
       public Path getPath() {
@@ -462,6 +463,15 @@ public class RFile {
      * @return this
      */
     WriterOptions withVisibilityCacheSize(int maxSize);
+
+    /**
+     * @param splitResolver builds a {@link LoadPlan} using table split points provided by the given
+     *        splitResolver.
+     * @return this
+     * @see RFileWriter#getLoadPlan(String)
+     * @since 2.1.4
+     */
+    WriterOptions withSplitResolver(LoadPlan.SplitResolver splitResolver);
 
     /**
      * @return a new RfileWriter created with the options previously specified.

@@ -28,7 +28,9 @@ import org.apache.accumulo.core.clientImpl.thrift.TableOperation;
 import org.apache.accumulo.core.clientImpl.thrift.TableOperationExceptionType;
 import org.apache.accumulo.core.data.NamespaceId;
 import org.apache.accumulo.core.data.TableId;
+import org.apache.accumulo.core.fate.FateId;
 import org.apache.accumulo.core.fate.Repo;
+import org.apache.accumulo.core.fate.zookeeper.DistributedReadWriteLock.LockType;
 import org.apache.accumulo.core.fate.zookeeper.ZooReaderWriter;
 import org.apache.accumulo.core.util.Pair;
 import org.apache.accumulo.core.util.tables.TableNameUtil;
@@ -40,15 +42,16 @@ import org.slf4j.LoggerFactory;
 public class RenameTable extends ManagerRepo {
 
   private static final long serialVersionUID = 1L;
-  private TableId tableId;
-  private NamespaceId namespaceId;
-  private String oldTableName;
-  private String newTableName;
+  private final TableId tableId;
+  private final NamespaceId namespaceId;
+  private final String oldTableName;
+  private final String newTableName;
 
   @Override
-  public long isReady(long tid, Manager env) throws Exception {
-    return Utils.reserveNamespace(env, namespaceId, tid, false, true, TableOperation.RENAME)
-        + Utils.reserveTable(env, tableId, tid, true, true, TableOperation.RENAME);
+  public long isReady(FateId fateId, Manager env) throws Exception {
+    return Utils.reserveNamespace(env, namespaceId, fateId, LockType.READ, true,
+        TableOperation.RENAME)
+        + Utils.reserveTable(env, tableId, fateId, LockType.WRITE, true, TableOperation.RENAME);
   }
 
   public RenameTable(NamespaceId namespaceId, TableId tableId, String oldTableName,
@@ -60,7 +63,7 @@ public class RenameTable extends ManagerRepo {
   }
 
   @Override
-  public Repo<Manager> call(long tid, Manager manager) throws Exception {
+  public Repo<Manager> call(FateId fateId, Manager manager) throws Exception {
     Pair<String,String> qualifiedOldTableName = TableNameUtil.qualify(oldTableName);
     Pair<String,String> qualifiedNewTableName = TableNameUtil.qualify(newTableName);
 
@@ -72,18 +75,18 @@ public class RenameTable extends ManagerRepo {
           "Namespace in new table name does not match the old table name");
     }
 
-    ZooReaderWriter zoo = manager.getContext().getZooReaderWriter();
+    ZooReaderWriter zoo = manager.getContext().getZooSession().asReaderWriter();
 
     Utils.getTableNameLock().lock();
     try {
-      Utils.checkTableDoesNotExist(manager.getContext(), newTableName, tableId,
+      Utils.checkTableNameDoesNotExist(manager.getContext(), newTableName, tableId,
           TableOperation.RENAME);
 
       final String newName = qualifiedNewTableName.getSecond();
       final String oldName = qualifiedOldTableName.getSecond();
 
-      final String tap =
-          manager.getZooKeeperRoot() + Constants.ZTABLES + "/" + tableId + Constants.ZTABLE_NAME;
+      final String tap = manager.getContext().getZooKeeperRoot() + Constants.ZTABLES + "/" + tableId
+          + Constants.ZTABLE_NAME;
 
       zoo.mutateExisting(tap, current -> {
         final String currentName = new String(current, UTF_8);
@@ -100,8 +103,8 @@ public class RenameTable extends ManagerRepo {
       manager.getContext().clearTableListCache();
     } finally {
       Utils.getTableNameLock().unlock();
-      Utils.unreserveTable(manager, tableId, tid, true);
-      Utils.unreserveNamespace(manager, namespaceId, tid, false);
+      Utils.unreserveTable(manager, tableId, fateId, LockType.WRITE);
+      Utils.unreserveNamespace(manager, namespaceId, fateId, LockType.READ);
     }
 
     LoggerFactory.getLogger(RenameTable.class).debug("Renamed table {} {} {}", tableId,
@@ -111,9 +114,9 @@ public class RenameTable extends ManagerRepo {
   }
 
   @Override
-  public void undo(long tid, Manager env) {
-    Utils.unreserveTable(env, tableId, tid, true);
-    Utils.unreserveNamespace(env, namespaceId, tid, false);
+  public void undo(FateId fateId, Manager env) {
+    Utils.unreserveTable(env, tableId, fateId, LockType.WRITE);
+    Utils.unreserveNamespace(env, namespaceId, fateId, LockType.READ);
   }
 
 }

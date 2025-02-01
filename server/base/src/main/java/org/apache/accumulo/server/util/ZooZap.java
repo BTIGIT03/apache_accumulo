@@ -18,24 +18,25 @@
  */
 package org.apache.accumulo.server.util;
 
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
-import org.apache.accumulo.core.Constants;
 import org.apache.accumulo.core.cli.Help;
 import org.apache.accumulo.core.conf.Property;
 import org.apache.accumulo.core.conf.SiteConfiguration;
-import org.apache.accumulo.core.data.InstanceId;
 import org.apache.accumulo.core.fate.zookeeper.ZooReaderWriter;
 import org.apache.accumulo.core.fate.zookeeper.ZooUtil.NodeMissingPolicy;
 import org.apache.accumulo.core.lock.ServiceLock;
+import org.apache.accumulo.core.lock.ServiceLockPaths.AddressSelector;
+import org.apache.accumulo.core.lock.ServiceLockPaths.ResourceGroupPredicate;
+import org.apache.accumulo.core.lock.ServiceLockPaths.ServiceLockPath;
 import org.apache.accumulo.core.singletons.SingletonManager;
 import org.apache.accumulo.core.singletons.SingletonManager.Mode;
-import org.apache.accumulo.core.volume.VolumeConfiguration;
-import org.apache.accumulo.server.fs.VolumeManager;
+import org.apache.accumulo.core.zookeeper.ZooSession;
+import org.apache.accumulo.server.ServerContext;
 import org.apache.accumulo.server.security.SecurityUtil;
 import org.apache.accumulo.start.spi.KeywordExecutable;
-import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.Path;
 import org.apache.zookeeper.KeeperException;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
@@ -69,9 +70,9 @@ public class ZooZap implements KeywordExecutable {
     boolean zapManager = false;
     @Parameter(names = "-tservers", description = "remove tablet server locks")
     boolean zapTservers = false;
-    @Parameter(names = "-compaction-coordinators",
-        description = "remove compaction coordinator locks")
-    boolean zapCoordinators = false;
+    @Parameter(names = "-group", description = "limit the zap to a specific resource group",
+        arity = 1)
+    String resourceGroup = "";
     @Parameter(names = "-compactors", description = "remove compactor locks")
     boolean zapCompactors = false;
     @Parameter(names = "-sservers", description = "remove scan server locks")
@@ -86,6 +87,19 @@ public class ZooZap implements KeywordExecutable {
 
   @Override
   public void execute(String[] args) throws Exception {
+    try {
+      var siteConf = SiteConfiguration.auto();
+      // Login as the server on secure HDFS
+      if (siteConf.getBoolean(Property.INSTANCE_RPC_SASL_ENABLED)) {
+        SecurityUtil.serverLogin(siteConf);
+      }
+      zap(siteConf, args);
+    } finally {
+      SingletonManager.setMode(Mode.CLOSED);
+    }
+  }
+
+  public void zap(SiteConfiguration siteConf, String... args) {
     Opts opts = new Opts();
     opts.parseArgs(keyword(), args);
 
@@ -94,106 +108,94 @@ public class ZooZap implements KeywordExecutable {
       return;
     }
 
-    try {
-      var siteConf = SiteConfiguration.auto();
+    try (var zk = new ZooSession(getClass().getSimpleName(), siteConf)) {
       // Login as the server on secure HDFS
       if (siteConf.getBoolean(Property.INSTANCE_RPC_SASL_ENABLED)) {
         SecurityUtil.serverLogin(siteConf);
       }
 
-      String volDir = VolumeConfiguration.getVolumeUris(siteConf).iterator().next();
-      Path instanceDir = new Path(volDir, "instance_id");
-      InstanceId iid = VolumeManager.getInstanceIDFromHdfs(instanceDir, new Configuration());
-      ZooReaderWriter zoo = new ZooReaderWriter(siteConf);
-
-      if (opts.zapManager) {
-        String managerLockPath = Constants.ZROOT + "/" + iid + Constants.ZMANAGER_LOCK;
-
-        try {
-          zapDirectory(zoo, managerLockPath, opts);
-        } catch (KeeperException | InterruptedException e) {
-          e.printStackTrace();
+      try (var context = new ServerContext(siteConf)) {
+        final ZooReaderWriter zrw = context.getZooSession().asReaderWriter();
+        if (opts.zapManager) {
+          ServiceLockPath managerLockPath = context.getServerPaths().createManagerPath();
+          try {
+            zapDirectory(zrw, managerLockPath, opts);
+          } catch (KeeperException | InterruptedException e) {
+            e.printStackTrace();
+          }
         }
-      }
 
-      if (opts.zapTservers) {
-        String tserversPath = Constants.ZROOT + "/" + iid + Constants.ZTSERVERS;
-        try {
-          List<String> children = zoo.getChildren(tserversPath);
-          for (String child : children) {
-            message("Deleting " + tserversPath + "/" + child + " from zookeeper", opts);
+        ResourceGroupPredicate rgp;
+        if (!opts.resourceGroup.isEmpty()) {
+          rgp = rg -> rg.equals(opts.resourceGroup);
+        } else {
+          rgp = rg -> true;
+        }
 
-            if (opts.zapManager) {
-              zoo.recursiveDelete(tserversPath + "/" + child, NodeMissingPolicy.SKIP);
-            } else {
-              var zLockPath = ServiceLock.path(tserversPath + "/" + child);
-              if (!zoo.getChildren(zLockPath.toString()).isEmpty()) {
-                if (!ServiceLock.deleteLock(zoo, zLockPath, "tserver")) {
-                  message("Did not delete " + tserversPath + "/" + child, opts);
+        if (opts.zapTservers) {
+          try {
+            Set<ServiceLockPath> tserverLockPaths =
+                context.getServerPaths().getTabletServer(rgp, AddressSelector.all(), false);
+            for (ServiceLockPath tserverPath : tserverLockPaths) {
+
+              message("Deleting " + tserverPath + " from zookeeper", opts);
+
+              if (opts.zapManager) {
+                zrw.recursiveDelete(tserverPath.toString(), NodeMissingPolicy.SKIP);
+              } else {
+                if (!zrw.getChildren(tserverPath.toString()).isEmpty()) {
+                  try {
+                    ServiceLock.deleteLock(zrw, tserverPath);
+                  } catch (RuntimeException e) {
+                    message("Did not delete " + tserverPath, opts);
+                  }
                 }
               }
             }
+          } catch (KeeperException | InterruptedException e) {
+            log.error("{}", e.getMessage(), e);
           }
-        } catch (KeeperException | InterruptedException e) {
-          log.error("{}", e.getMessage(), e);
         }
-      }
 
-      if (opts.zapCoordinators) {
-        final String coordinatorPath = Constants.ZROOT + "/" + iid + Constants.ZCOORDINATOR_LOCK;
-        try {
-          if (zoo.exists(coordinatorPath)) {
-            zapDirectory(zoo, coordinatorPath, opts);
-          }
-        } catch (KeeperException | InterruptedException e) {
-          log.error("Error deleting coordinator from zookeeper, {}", e.getMessage(), e);
-        }
-      }
-
-      if (opts.zapCompactors) {
-        String compactorsBasepath = Constants.ZROOT + "/" + iid + Constants.ZCOMPACTORS;
-        try {
-          if (zoo.exists(compactorsBasepath)) {
-            List<String> queues = zoo.getChildren(compactorsBasepath);
-            for (String queue : queues) {
-              message("Deleting " + compactorsBasepath + "/" + queue + " from zookeeper", opts);
-              zoo.recursiveDelete(compactorsBasepath + "/" + queue, NodeMissingPolicy.SKIP);
+        if (opts.zapCompactors) {
+          Set<ServiceLockPath> compactorLockPaths =
+              context.getServerPaths().getCompactor(rgp, AddressSelector.all(), false);
+          Set<String> compactorResourceGroupPaths = new HashSet<>();
+          compactorLockPaths.forEach(p -> compactorResourceGroupPaths
+              .add(p.toString().substring(0, p.toString().lastIndexOf('/'))));
+          try {
+            for (String group : compactorResourceGroupPaths) {
+              message("Deleting " + group + " from zookeeper", opts);
+              zrw.recursiveDelete(group, NodeMissingPolicy.SKIP);
             }
+          } catch (KeeperException | InterruptedException e) {
+            log.error("Error deleting compactors from zookeeper, {}", e.getMessage(), e);
           }
-        } catch (KeeperException | InterruptedException e) {
-          log.error("Error deleting compactors from zookeeper, {}", e.getMessage(), e);
+
         }
 
-      }
-
-      if (opts.zapScanServers) {
-        String sserversPath = Constants.ZROOT + "/" + iid + Constants.ZSSERVERS;
-        try {
-          if (zoo.exists(sserversPath)) {
-            List<String> children = zoo.getChildren(sserversPath);
-            for (String child : children) {
-              message("Deleting " + sserversPath + "/" + child + " from zookeeper", opts);
-
-              var zLockPath = ServiceLock.path(sserversPath + "/" + child);
-              if (!zoo.getChildren(zLockPath.toString()).isEmpty()) {
-                ServiceLock.deleteLock(zoo, zLockPath);
+        if (opts.zapScanServers) {
+          try {
+            Set<ServiceLockPath> sserverLockPaths =
+                context.getServerPaths().getScanServer(rgp, AddressSelector.all(), false);
+            for (ServiceLockPath sserverPath : sserverLockPaths) {
+              message("Deleting " + sserverPath + " from zookeeper", opts);
+              if (!zrw.getChildren(sserverPath.toString()).isEmpty()) {
+                ServiceLock.deleteLock(zrw, sserverPath);
               }
             }
+          } catch (KeeperException | InterruptedException e) {
+            log.error("{}", e.getMessage(), e);
           }
-        } catch (KeeperException | InterruptedException e) {
-          log.error("{}", e.getMessage(), e);
         }
       }
 
-    } finally {
-      SingletonManager.setMode(Mode.CLOSED);
     }
-
   }
 
-  private static void zapDirectory(ZooReaderWriter zoo, String path, Opts opts)
+  private static void zapDirectory(ZooReaderWriter zoo, ServiceLockPath path, Opts opts)
       throws KeeperException, InterruptedException {
-    List<String> children = zoo.getChildren(path);
+    List<String> children = zoo.getChildren(path.toString());
     for (String child : children) {
       message("Deleting " + path + "/" + child + " from zookeeper", opts);
       zoo.recursiveDelete(path + "/" + child, NodeMissingPolicy.SKIP);
