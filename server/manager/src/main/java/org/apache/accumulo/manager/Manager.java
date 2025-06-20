@@ -558,15 +558,14 @@ public class Manager extends AbstractServer implements LiveTServerSet.Listener {
           var ample = getContext().getAmple();
           for (DataLevel dl : DataLevel.values()) {
             // prev row needed for the extent
-            try (
-                var tabletsMetadata = ample.readTablets().forLevel(dl)
-                    .fetch(TabletMetadata.ColumnType.PREV_ROW, TabletMetadata.ColumnType.MIGRATION,
-                        TabletMetadata.ColumnType.LOCATION)
-                    .build();
+            try (var tabletsMetadata = ample.readTablets().forLevel(dl)
+                .fetch(TabletMetadata.ColumnType.PREV_ROW, TabletMetadata.ColumnType.MIGRATION,
+                    TabletMetadata.ColumnType.LOCATION)
+                .filter(new HasMigrationFilter()).build();
                 var tabletsMutator = ample.conditionallyMutateTablets(result -> {})) {
               for (var tabletMetadata : tabletsMetadata) {
                 var migration = tabletMetadata.getMigration();
-                if (migration != null && shouldCleanupMigration(tabletMetadata)) {
+                if (shouldCleanupMigration(tabletMetadata)) {
                   tabletsMutator.mutateTablet(tabletMetadata.getExtent()).requireAbsentOperation()
                       .requireMigration(migration).deleteMigration().submit(tm -> false);
                 }
@@ -647,8 +646,7 @@ public class Manager extends AbstractServer implements LiveTServerSet.Listener {
               TabletMetadata.ColumnType.MIGRATION, TabletMetadata.ColumnType.LOCATION)
           .filter(new HasMigrationFilter()).build()) {
         // filter out migrations that are awaiting cleanup
-        tabletsMetadata.stream()
-            .filter(tm -> tm.getMigration() != null && !shouldCleanupMigration(tm))
+        tabletsMetadata.stream().filter(tm -> !shouldCleanupMigration(tm))
             .forEach(tm -> extents.add(tm.getExtent()));
       }
       partitionedMigrations.put(dl, extents);
@@ -909,9 +907,15 @@ public class Manager extends AbstractServer implements LiveTServerSet.Listener {
       int levelsCompleted = 0;
 
       for (DataLevel dl : DataLevel.values()) {
+
         if (dl == DataLevel.USER && tabletsNotHosted > 0) {
           log.debug("not balancing user tablets because there are {} unhosted tablets",
               tabletsNotHosted);
+          continue;
+        }
+
+        if (dl == DataLevel.USER && !canAssignAndBalance()) {
+          log.debug("not balancing user tablets because not enough tablet servers");
           continue;
         }
 
@@ -1124,11 +1128,11 @@ public class Manager extends AbstractServer implements LiveTServerSet.Listener {
         compactionCoordinator.getThriftService(), managerClientHandler, getContext());
 
     try {
-      sa = TServerUtils.createThriftServer(context, getHostname(), Property.MANAGER_CLIENTPORT,
+      sa = TServerUtils.createThriftServer(context, getBindAddress(), Property.MANAGER_CLIENTPORT,
           processor, "Manager", null, Property.MANAGER_MINTHREADS,
           Property.MANAGER_MINTHREADS_TIMEOUT, Property.MANAGER_THREADCHECK);
     } catch (UnknownHostException e) {
-      throw new IllegalStateException("Unable to start server on host " + getHostname(), e);
+      throw new IllegalStateException("Unable to start server on host " + getBindAddress(), e);
     }
 
     // block until we can obtain the ZK lock for the manager. Create the
@@ -1150,7 +1154,7 @@ public class Manager extends AbstractServer implements LiveTServerSet.Listener {
     // Set the HostName **after** initially creating the lock. The lock data is
     // updated below with the correct address. This prevents clients from accessing
     // the Manager until all of the internal processes are started.
-    setHostname(sa.address);
+    updateAdvertiseAddress(sa.getAddress());
 
     recoveryManager = new RecoveryManager(this, timeToCacheRecoveryWalExistence);
 
@@ -1390,8 +1394,8 @@ public class Manager extends AbstractServer implements LiveTServerSet.Listener {
     ServiceDescriptors descriptors = new ServiceDescriptors();
     for (ThriftService svc : new ThriftService[] {ThriftService.MANAGER, ThriftService.COORDINATOR,
         ThriftService.FATE}) {
-      descriptors
-          .addService(new ServiceDescriptor(uuid, svc, getHostname(), this.getResourceGroup()));
+      descriptors.addService(new ServiceDescriptor(uuid, svc, getAdvertiseAddress().toString(),
+          this.getResourceGroup()));
     }
 
     sld = new ServiceLockData(descriptors);
@@ -1578,14 +1582,15 @@ public class Manager extends AbstractServer implements LiveTServerSet.Listener {
     var zooKeeper = getContext().getZooSession();
     log.info("trying to get manager lock");
 
-    final String managerClientAddress =
-        getHostname() + ":" + getConfiguration().getPort(Property.MANAGER_CLIENTPORT)[0];
-
     UUID zooLockUUID = UUID.randomUUID();
 
     ServiceDescriptors descriptors = new ServiceDescriptors();
+    // This method creates the lock with the ThriftServer set to NONE
+    // and the address set to 0.0.0.0. When the lock is acquired (could be
+    // waiting to due an HA-pair), then the Manager startup process begins
+    // and the lock service descriptors are updated with the advertise address
     descriptors.addService(new ServiceDescriptor(zooLockUUID, ThriftService.NONE,
-        managerClientAddress, this.getResourceGroup()));
+        ConfigOpts.BIND_ALL_ADDRESSES, this.getResourceGroup()));
     ServiceLockData sld = new ServiceLockData(descriptors);
     managerLock = new ServiceLock(zooKeeper, zManagerLoc, zooLockUUID);
     HAServiceLockWatcher managerLockWatcher =
@@ -1856,6 +1861,17 @@ public class Manager extends AbstractServer implements LiveTServerSet.Listener {
                 Map::putAll),
             assignedOut);
     tabletBalancer.getAssignments(params);
+    if (!canAssignAndBalance()) {
+      // remove assignment for user tables
+      Iterator<KeyExtent> iter = assignedOut.keySet().iterator();
+      while (iter.hasNext()) {
+        KeyExtent ke = iter.next();
+        if (!ke.isMeta()) {
+          iter.remove();
+          log.trace("Removed assignment for {} as assignments for user tables is disabled.", ke);
+        }
+      }
+    }
   }
 
   public TabletStateStore getTabletStateStore(DataLevel level) {
@@ -1891,13 +1907,26 @@ public class Manager extends AbstractServer implements LiveTServerSet.Listener {
   private long numMigrations() {
     long count = 0;
     for (DataLevel dl : DataLevel.values()) {
-      // prev row needed for the extent
       try (var tabletsMetadata = getContext().getAmple().readTablets().forLevel(dl)
-          .fetch(TabletMetadata.ColumnType.PREV_ROW, TabletMetadata.ColumnType.MIGRATION).build()) {
-        count += tabletsMetadata.stream()
-            .filter(tabletMetadata -> tabletMetadata.getMigration() != null).count();
+          .fetch(TabletMetadata.ColumnType.MIGRATION).filter(new HasMigrationFilter()).build()) {
+        count += tabletsMetadata.stream().count();
       }
     }
     return count;
+  }
+
+  private boolean canAssignAndBalance() {
+    final int threshold =
+        getConfiguration().getCount(Property.MANAGER_TABLET_BALANCER_TSERVER_THRESHOLD);
+    if (threshold == 0) {
+      return true;
+    }
+    final int numTServers = tserverSet.size();
+    final boolean result = numTServers >= threshold;
+    if (!result) {
+      log.warn("Not assigning or balancing as number of tservers ({}) is below threshold ({})",
+          numTServers, threshold);
+    }
+    return result;
   }
 }
